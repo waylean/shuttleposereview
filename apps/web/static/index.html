@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ShuttlePoseReview</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="/">
+          <span aria-hidden="true">🏸</span>
+          <strong>ShuttlePoseReview</strong>
+        </a>
+        <button class="ghost" id="newReviewButton" type="button" hidden>新建复盘</button>
+      </header>
+
+      <section class="landing" id="uploadPanel">
+        <div class="hero-copy">
+          <h1>把一段打球视频变成动作复盘</h1>
+          <p>上传手机录制的视频，本机后台会完成预处理、骨架提取、动作阶段识别，并生成可查看的复盘页面。</p>
+        </div>
+
+        <div class="upload-card">
+          <label class="drop-zone" id="dropZone">
+            <input id="videoInput" type="file" accept="video/*" />
+            <span class="drop-icon" aria-hidden="true">🏸</span>
+            <strong id="fileName">选择或拖入视频</strong>
+            <small>建议先用 15-60 秒片段测试，支持 MP4 / MOV / M4V / MKV / WEBM。</small>
+          </label>
+          <button id="startButton" disabled type="button">开始复盘</button>
+        </div>
+
+        <section class="recent" id="recentPanel" hidden>
+          <div class="section-title">
+            <h2>最近复盘</h2>
+            <button class="text-button" id="refreshJobsButton" type="button">刷新</button>
+          </div>
+          <div class="recent-list" id="recentJobs"></div>
+        </section>
+      </section>
+
+      <section class="panel job-panel" id="jobPanel" hidden>
+        <div class="smash-loader" aria-hidden="true">
+          <div class="player">
+            <span class="head"></span>
+            <span class="body"></span>
+            <span class="arm"></span>
+            <span class="leg front"></span>
+            <span class="leg back"></span>
+            <span class="racket"></span>
+          </div>
+          <span class="shuttle"></span>
+          <span class="court-line"></span>
+        </div>
+        <div class="job-copy">
+          <h2 id="stageText">排队中</h2>
+          <p id="jobText">正在等待后台 worker 开始处理。</p>
+          <div class="progress"><i id="progressBar"></i></div>
+          <div class="progress-row">
+            <small id="progressText">0%</small>
+            <a id="liveLog" target="_blank" rel="noreferrer" hidden>日志</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="result-workspace" id="resultPanel" hidden>
+        <section class="review-frame-panel">
+          <div class="section-title">
+            <h2>动作复盘</h2>
+            <a id="openReport" target="_blank" rel="noreferrer">完整页面</a>
+          </div>
+          <iframe id="reportFrame" title="动作复盘报告"></iframe>
+        </section>
+
+        <aside class="result-side">
+          <section class="side-card">
+            <h2>标注视频</h2>
+            <video id="overlayVideo" controls playsinline></video>
+          </section>
+          <section class="side-card">
+            <h2>输出文件</h2>
+            <div class="file-actions">
+              <a id="openOverlay" target="_blank" rel="noreferrer">下载标注视频</a>
+              <a id="openJson" target="_blank" rel="noreferrer">下载 JSON 数据</a>
+              <a id="openPoseOverlay" target="_blank" rel="noreferrer">查看原始骨架视频</a>
+              <a id="openResultLog" target="_blank" rel="noreferrer">查看处理日志</a>
+            </div>
+          </section>
+        </aside>
+      </section>
+
+      <section class="panel error-panel" id="errorPanel" hidden>
+        <div>
+          <h2>处理失败</h2>
+          <p id="errorText"></p>
+        </div>
+        <div class="actions">
+          <a id="openLog" target="_blank" rel="noreferrer">查看日志</a>
+          <button class="ghost" id="retryButton" type="button">重新上传</button>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

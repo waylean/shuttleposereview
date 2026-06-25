@@ -1,0 +1,30 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+dist/
+
+# Local Web MVP runtime data
+apps/web/uploads/
+apps/web/results/
+apps/web/jobs/
+
+# Generated analysis outputs and local experiments
+outputs/
+work/external/
+work/Good-Badminton/
+work/frames/
+work/lindan_frames/
+work/lindan_processed/
+work/lindan_structured/
+work/personal_video_inputs/
+work/personal_video_results*/
+work/scripts/*
+!work/scripts/build_2d_action_review.py
+!work/scripts/mediapipe_holistic_test.py
+
+# Large local video inputs
+*.MOV
+*.mov
