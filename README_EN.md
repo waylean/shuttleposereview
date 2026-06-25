@@ -25,12 +25,6 @@ The recommended download channel is GitHub Releases:
 https://github.com/waylean/shuttleposereview/releases
 ```
 
-For users who cannot access GitHub reliably, the maintainer may upload `shuttleposereview1.0.apk` or a later signed APK to Quark Cloud Drive and place the mirror link here:
-
-```text
-Quark Cloud Drive mirror: pending
-```
-
 Local Android 1.0 APK path:
 
 ```text
