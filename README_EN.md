@@ -25,12 +25,6 @@ The recommended download channel is GitHub Releases:
 https://github.com/waylean/shuttleposereview/releases
 ```
 
-Local Android 1.0 APK path:
-
-```text
-apps/android/app/build/outputs/apk/debug/shuttleposereview1.0.apk
-```
-
 Android build command:
 
 ```bash
@@ -47,16 +41,6 @@ cd apps/android
 
 After installation, tap "选择或导入视频", wait for the review to finish, then view the skeleton-overlay video, power-action timeline, and three action metrics. The "下载姿态合成视频" button exports an MP4 with the skeleton overlay.
 
-## Promo Video Materials
-
-For a vertical introduction video, see:
-
-```text
-docs/hyperframes_promo_prompt.md
-docs/promo_subtitles_zh.srt
-```
-
-`hyperframes_promo_prompt.md` can be used with HyperFrames to generate a no-voiceover video. `promo_subtitles_zh.srt` can be imported into CapCut, Premiere, or another editor before adding your own narration.
 
 ## Demo
 
@@ -285,13 +269,6 @@ stroke_metrics[].score_breakdown
 
 This allows each total score to be traced back to its specific windows, angles, speeds, sub-scores, and weights.
 
-## Next Directions
-
-- Build a manually labeled dataset: power-action windows, contact timing, kinetic chain, and recovery quality.
-- Run camera perturbation experiments: crop, scale, and rotate videos to observe score drift.
-- Validate correlation with coach scoring: use Spearman correlation to evaluate whether the three metrics align with human judgment.
-- Evaluate lighter pose models and explore Android / iOS deployment.
-- Segment long videos into short rallies to reduce waiting time and false detections.
 
 ## Acknowledgements
 
