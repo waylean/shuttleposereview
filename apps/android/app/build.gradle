@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.waylean.shuttleposereview.ondevice'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.waylean.shuttleposereview.ondevice"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1"
+    }
+
+    androidResources {
+        noCompress += ['task', 'mp4']
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'com.google.mediapipe:tasks-vision:0.10.35'
+}

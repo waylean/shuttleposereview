@@ -7,12 +7,62 @@ The project aims to help amateur players see more clearly whether a shot was tak
 ## Current Features
 
 - Upload a badminton video and create a local review job.
+- On Android, select a video from the phone gallery and run frame sampling, pose recognition, and review fully on device.
 - Preprocess the video into an MP4 format that is easier for both the browser and the algorithm to handle.
 - Use a human pose model to extract the near-side player's 2D skeleton.
 - Overlay the skeleton on the video and generate a playable action review page.
+- Export an MP4 video with the pose skeleton composited on top for saving, sharing, or editing.
+- Cache reviewed videos locally so the last review can be opened directly without waiting for the same analysis again.
 - Automatically detect obvious power-action windows, instead of treating every net shot, block, or transition shot as one power action.
 - Output three scores and a full formula breakdown for each power-action window.
 - Export structured JSON for training logs, cross-session comparison, and algorithm evaluation.
+
+## Android APK Download
+
+The recommended download channel is GitHub Releases:
+
+```text
+https://github.com/waylean/shuttleposereview/releases
+```
+
+For users who cannot access GitHub reliably, the maintainer may upload `app-debug.apk` or a later signed APK to Quark Cloud Drive and place the mirror link here:
+
+```text
+Quark Cloud Drive mirror: pending
+```
+
+Local debug APK build path:
+
+```text
+apps/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Android build command:
+
+```bash
+cd apps/android
+./gradlew :app:assembleDebug
+```
+
+Windows PowerShell:
+
+```powershell
+cd apps/android
+.\gradlew.bat :app:assembleDebug
+```
+
+After installation, tap "选择或导入视频", wait for the review to finish, then view the skeleton-overlay video, power-action timeline, and three action metrics. The "下载姿态合成视频" button exports an MP4 with the skeleton overlay.
+
+## Promo Video Materials
+
+For a vertical introduction video, see:
+
+```text
+docs/hyperframes_promo_prompt.md
+docs/promo_subtitles_zh.srt
+```
+
+`hyperframes_promo_prompt.md` can be used with HyperFrames to generate a no-voiceover video. `promo_subtitles_zh.srt` can be imported into CapCut, Premiere, or another editor before adding your own narration.
 
 ## Demo
 

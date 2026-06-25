@@ -6,6 +6,12 @@ venv/
 env/
 dist/
 
+# Android build outputs
+apps/android/.gradle/
+apps/android/build/
+apps/android/app/build/
+*.apk
+
 # Local Web MVP runtime data
 apps/web/uploads/
 apps/web/results/
