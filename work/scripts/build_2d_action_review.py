@@ -794,9 +794,17 @@ def build_video(video_path, raw_frames, records, events, out_dir, label, fps):
         raise RuntimeError(str(video_path))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    temp = out_dir / f"{label}_2d_review.temp.mp4"
     out = out_dir / f"{label}_2d_review_overlay.mp4"
-    writer = cv2.VideoWriter(str(temp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    writer = subprocess.Popen(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
+        ],
+        stdin=subprocess.PIPE,
+    )
     idx = 0
     while True:
         ok, frame = cap.read()
@@ -804,35 +812,12 @@ def build_video(video_path, raw_frames, records, events, out_dir, label, fps):
             break
         draw_skeleton(frame, records[idx], raw_frames[idx])
         draw_panel(frame, records[idx], None)
-        writer.write(frame)
+        writer.stdin.write(frame.tobytes())
         idx += 1
     cap.release()
-    writer.release()
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(temp),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(out),
-        ],
-        check=True,
-    )
-    temp.unlink(missing_ok=True)
+    writer.stdin.close()
+    if writer.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed to encode {out}")
     return out
 
 

@@ -157,9 +157,17 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = frames_total / fps if fps else 0
 
-    temp_video = out_dir / f"{args.label}_holistic.temp.mp4"
     output_video = out_dir / f"{args.label}_holistic_overlay.mp4"
-    writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    writer = subprocess.Popen(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_video),
+        ],
+        stdin=subprocess.PIPE,
+    )
 
     frame_records = []
     pose_count = left_hand_count = right_hand_count = 0
@@ -205,7 +213,7 @@ def main():
                 2,
                 cv2.LINE_AA,
             )
-            writer.write(frame)
+            writer.stdin.write(frame.tobytes())
 
             frame_records.append(
                 {
@@ -220,33 +228,10 @@ def main():
             frame_idx += 1
 
     cap.release()
-    writer.release()
+    writer.stdin.close()
+    if writer.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed to encode {output_video}")
     elapsed = time.time() - started
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(temp_video),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(output_video),
-        ],
-        check=True,
-    )
-    temp_video.unlink(missing_ok=True)
 
     n = len(frame_records)
     metrics = {
