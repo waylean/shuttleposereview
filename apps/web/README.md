@@ -37,5 +37,11 @@ work/Good-Badminton/.venv/bin/python -m uvicorn apps.web.main:app --host 127.0.0
 - Jobs are stored under `apps/web/jobs`.
 - Uploaded videos are stored under `apps/web/uploads`.
 - Generated results are stored under `apps/web/results`.
+- The preprocessing step requires a working `ffmpeg` command. If Windows reports `[WinError 2] 系统找不到指定的文件`, install FFmpeg and add its `bin` directory to `PATH`, then verify:
+
+```powershell
+ffmpeg -version
+```
+
 - The first implementation uses an in-process background queue for simple local demos. For production, replace it with Redis/RQ, Celery, or a cloud job runner.
 - The current analysis is pose-only and does not claim true shuttle speed, true 3D reconstruction, or medical-grade biomechanical diagnosis.

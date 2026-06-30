@@ -80,6 +80,22 @@ def valid_suffix(filename: str) -> str:
 def run_step(job_id: str, title: str, progress: int, command: list[str]) -> None:
     patch_job(job_id, status="processing", stage=title, progress=progress)
     started = time.time()
+    log_path = RESULT_DIR / job_id / "pipeline.log"
+    executable = command[0]
+    executable_path = Path(executable)
+    if executable_path.parent == Path("."):
+        executable_exists = shutil.which(executable) is not None
+    else:
+        executable_exists = executable_path.exists()
+    if not executable_exists:
+        hint = dependency_hint(executable)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n\n## {title} (0.0s)\n")
+            handle.write("$ " + " ".join(command) + "\n")
+            handle.write(f"Missing executable: {executable}\n")
+            if hint:
+                handle.write(hint + "\n")
+        raise RuntimeError(hint or f"找不到可执行文件：{executable}")
     proc = subprocess.run(
         command,
         cwd=str(REPO_ROOT),
@@ -87,13 +103,26 @@ def run_step(job_id: str, title: str, progress: int, command: list[str]) -> None
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    log_path = RESULT_DIR / job_id / "pipeline.log"
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"\n\n## {title} ({time.time() - started:.1f}s)\n")
         handle.write("$ " + " ".join(command) + "\n")
         handle.write(proc.stdout or "")
     if proc.returncode != 0:
         raise RuntimeError(f"{title} failed; see {log_path}")
+
+
+def dependency_hint(executable: str) -> str | None:
+    name = Path(executable).name.lower()
+    if name in {"ffmpeg", "ffmpeg.exe"}:
+        return (
+            "找不到 ffmpeg。请先安装 FFmpeg，并确认在终端执行 `ffmpeg -version` "
+            "可以正常输出版本信息；Windows 用户需要把 FFmpeg 的 bin 目录加入 PATH。"
+        )
+    if name.startswith("python"):
+        return (
+            "找不到 Python 解释器。请确认使用已安装依赖的 Python/venv 启动 Web 服务。"
+        )
+    return None
 
 
 def open_report_on_review_screen(report: Path) -> None:
