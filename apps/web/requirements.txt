@@ -1,3 +1,6 @@
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 python-multipart>=0.0.9,<1.0
+mediapipe==0.10.21
+opencv-contrib-python>=4.11,<4.12
+numpy>=1.26,<2.0

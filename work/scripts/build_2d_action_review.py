@@ -157,6 +157,42 @@ def robust_events(values, fps, limit=6):
     return sorted(selected)
 
 
+def robust_strike_candidates(values, fps, power_events=None, limit=80):
+    """Return broader likely contact moments for review playback.
+
+    Power events stay intentionally conservative for scoring. This broader pass
+    uses a lower threshold and shorter separation so light blocks, drives and
+    lifts still appear on the timeline and can trigger slow motion.
+    """
+    arr = np.asarray(values, dtype=np.float32)
+    if len(arr) < 5 or float(arr.max()) <= 0:
+        return sorted(power_events or [])
+    power_events = list(power_events or [])
+    threshold = max(float(np.percentile(arr, 72)), float(arr.max()) * 0.18)
+    gap = int(max(8, fps * 0.34))
+    pre_power_gap = int(max(5, round(fps * 0.36)))
+    follow_power_gap = int(max(8, round(fps * 0.62)))
+    candidates = []
+    for i in range(2, len(arr) - 2):
+        if arr[i] < threshold:
+            continue
+        if arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
+            candidates.append((float(arr[i]), i))
+    candidates.sort(reverse=True)
+
+    selected = list(power_events)
+    for _, idx in candidates:
+        if any(0 < power_idx - idx <= pre_power_gap for power_idx in power_events):
+            continue
+        if any(0 < idx - power_idx <= follow_power_gap for power_idx in power_events):
+            continue
+        if all(abs(idx - old) >= gap for old in selected):
+            selected.append(idx)
+        if len(selected) >= limit:
+            break
+    return sorted(selected)
+
+
 def wrist_height(frame, side):
     shoulder, _, wrist = LEFT_ARM if side == "left" else RIGHT_ARM
     sh = point(frame, shoulder)
@@ -220,6 +256,67 @@ def active_side(frame, left_speed, right_speed):
     return "left" if left_score >= right_score else "right"
 
 
+def side_identity_score(frame, side, wrist_speed):
+    shoulder, elbow, wrist = LEFT_ARM if side == "left" else RIGHT_ARM
+    sh = point(frame, shoulder)
+    wr = point(frame, wrist)
+    conf = min(visibility(frame, shoulder), visibility(frame, elbow), visibility(frame, wrist))
+    height = float(sh[1] - wr[1]) if sh is not None and wr is not None else 0.0
+    height_bonus = 1.0 + max(0.0, height) / 85.0
+    low_height_penalty = max(0.0, -height) * 2.2
+    # Identity should be stricter than event detection; low-confidence fast jumps are often the hidden arm swapping in.
+    confidence_gate = max(0.03, conf ** 1.7)
+    return max(0.0, float(wrist_speed) * height_bonus * confidence_gate - low_height_penalty + conf * 18.0)
+
+
+def infer_racket_side(raw_frames, left_speed, right_speed, events, fps):
+    if not raw_frames:
+        return "right", {"left": 0.0, "right": 0.0, "decision": "empty"}
+    focus = set()
+    if events:
+        for event_idx in events:
+            lo = max(0, int(event_idx - fps * 0.65))
+            hi = min(len(raw_frames) - 1, int(event_idx + fps * 0.25))
+            focus.update(range(lo, hi + 1))
+    else:
+        focus.update(range(len(raw_frames)))
+
+    left_total = 0.0
+    right_total = 0.0
+    left_visible = 0
+    right_visible = 0
+    for idx in sorted(focus):
+        frame = raw_frames[idx]
+        left_total += side_identity_score(frame, "left", left_speed[idx])
+        right_total += side_identity_score(frame, "right", right_speed[idx])
+        if min(visibility(frame, 11), visibility(frame, 13), visibility(frame, 15)) >= 0.45:
+            left_visible += 1
+        if min(visibility(frame, 12), visibility(frame, 14), visibility(frame, 16)) >= 0.45:
+            right_visible += 1
+
+    if max(left_total, right_total) <= 1e-6:
+        side = "left" if left_visible >= right_visible else "right"
+        decision = "visibility_fallback"
+    else:
+        side = "left" if left_total >= right_total else "right"
+        decision = "confidence_weighted_motion"
+    return side, {
+        "left": round(left_total, 2),
+        "right": round(right_total, 2),
+        "left_visible_frames": left_visible,
+        "right_visible_frames": right_visible,
+        "decision": decision,
+    }
+
+
+def assign_stable_active_side(records, racket_side):
+    for rec in records:
+        rec["raw_active_side"] = rec.get("active_side")
+        rec["stable_active_side"] = racket_side
+        rec["active_side_switch_suppressed"] = rec.get("active_side") != racket_side
+    return records
+
+
 def side_indices(side):
     return (LEFT_ARM, LEFT_LEG) if side == "left" else (RIGHT_ARM, RIGHT_LEG)
 
@@ -246,6 +343,271 @@ def pose_bbox(frame, padding_ratio=0.38):
     height = max(1.0, float(y2 - y1))
     pad = max(width, height) * padding_ratio
     return [round(float(x1 - pad), 2), round(float(y1 - pad), 2), round(float(x2 + pad), 2), round(float(y2 + pad), 2)]
+
+
+def stabilize_display_pose(records, fps, enable_arm_reconstruction=False):
+    """Stabilize the pose used for visual replay without changing scoring metrics."""
+    if not records:
+        return records
+    keypoints = range(11, 29)
+    arm_points = {13, 14, 15, 16}
+    wrist_points = {15, 16}
+    arm_bones = [(11, 13), (13, 15), (12, 14), (14, 16)]
+
+    def valid(p, threshold=0.08):
+        return p is not None and len(p) >= 3 and float(p[2]) >= threshold
+
+    def median_bone(a, b, default):
+        vals = []
+        for rec in records:
+            pose = rec.get("pose2d") or []
+            if a >= len(pose) or b >= len(pose) or not valid(pose[a], 0.28) or not valid(pose[b], 0.28):
+                continue
+            vals.append(float(np.linalg.norm(np.asarray(pose[a][:2], dtype=np.float32) - np.asarray(pose[b][:2], dtype=np.float32))))
+        return float(np.median(vals)) if vals else default
+
+    torso_values = [float(r.get("torso_length_px") or 0.0) for r in records if float(r.get("torso_length_px") or 0.0) > 20.0]
+    default_torso = float(np.median(torso_values)) if torso_values else 72.0
+    target_lengths = {
+        (11, 13): median_bone(11, 13, default_torso * 0.46),
+        (13, 15): median_bone(13, 15, default_torso * 0.50),
+        (12, 14): median_bone(12, 14, default_torso * 0.46),
+        (14, 16): median_bone(14, 16, default_torso * 0.50),
+    }
+
+    prev_pose = None
+    prev_velocity = {}
+    missing = {idx: 0 for idx in keypoints}
+
+    def clamp_step(prev, cur, max_step):
+        delta = cur - prev
+        norm = float(np.linalg.norm(delta))
+        if norm <= max_step or norm <= 1e-6:
+            return cur
+        return prev + delta / norm * max_step
+
+    def enforce_bone(pose, a, b, target):
+        if a >= len(pose) or b >= len(pose) or not valid(pose[a]) or not valid(pose[b]):
+            return
+        pa = np.asarray(pose[a][:2], dtype=np.float32)
+        pb = np.asarray(pose[b][:2], dtype=np.float32)
+        vec = pb - pa
+        length = float(np.linalg.norm(vec))
+        if length <= 1e-6:
+            return
+        ratio = length / max(target, 1.0)
+        if 0.68 <= ratio <= 1.42:
+            return
+        corrected = pa + vec / length * target
+        blend = 0.72
+        pose[b][0] = round(float(pb[0] * (1.0 - blend) + corrected[0] * blend), 2)
+        pose[b][1] = round(float(pb[1] * (1.0 - blend) + corrected[1] * blend), 2)
+
+    def phase_target_py(shoulder, torso, side, phase):
+        side_sign = -1.0 if side == "left" else 1.0
+        spec = {
+            "ready": (0.24, 0.18),
+            "backswing": (0.48, -0.58),
+            "drive": (0.38, -0.82),
+            "contact": (0.34, -0.96),
+            "follow": (-0.36, 0.30),
+            "recover": (0.12, 0.18),
+        }.get(phase, (0.20, 0.0))
+        return np.asarray([shoulder[0] + side_sign * torso * spec[0], shoulder[1] + torso * spec[1]], dtype=np.float32)
+
+    def solve_arm_py(shoulder, target, upper, lower, side):
+        side_sign = -1.0 if side == "left" else 1.0
+        vec = target - shoulder
+        distance = float(np.linalg.norm(vec))
+        if distance <= 1e-6:
+            distance = 1e-6
+            vec = np.asarray([side_sign, 0.0], dtype=np.float32)
+        max_reach = max(upper + lower - 2.0, 12.0)
+        min_reach = max(abs(upper - lower) + 2.0, 10.0)
+        target = shoulder + vec / distance * clamp(float(distance), min_reach, max_reach)
+        vec = target - shoulder
+        distance = max(float(np.linalg.norm(vec)), 1e-6)
+        unit = vec / distance
+        along = clamp((upper * upper - lower * lower + distance * distance) / (2.0 * distance), 0.0, upper)
+        height = math.sqrt(max(0.0, upper * upper - along * along))
+        base = shoulder + unit * along
+        perp = np.asarray([-unit[1], unit[0]], dtype=np.float32) * side_sign
+        elbow = base + perp * height
+        return elbow, target
+
+    def reconstruct_active_arm_if_needed(pose, raw_pose, rec, torso):
+        side = rec.get("stable_active_side") or rec.get("active_side")
+        if side not in {"left", "right"} or rec.get("phase") not in {"backswing", "drive", "contact", "follow"}:
+            return
+        shoulder_idx, elbow_idx, wrist_idx = (11, 13, 15) if side == "left" else (12, 14, 16)
+        if shoulder_idx >= len(pose) or not valid(pose[shoulder_idx], 0.12):
+            return
+        raw_conf = 0.0
+        if len(raw_pose) > wrist_idx:
+            vals = [raw_pose[j][2] for j in (shoulder_idx, elbow_idx, wrist_idx) if j < len(raw_pose) and raw_pose[j] is not None]
+            raw_conf = min(vals) if vals else 0.0
+        current_ok = valid(pose[elbow_idx], 0.12) and valid(pose[wrist_idx], 0.12)
+        elbow_angle = None
+        if current_ok:
+            sh = np.asarray(pose[shoulder_idx][:2], dtype=np.float32)
+            el = np.asarray(pose[elbow_idx][:2], dtype=np.float32)
+            wr = np.asarray(pose[wrist_idx][:2], dtype=np.float32)
+            elbow_angle = angle_deg(sh, el, wr)
+        folded = elbow_angle is not None and (elbow_angle < 45.0 or elbow_angle > 178.0)
+        low_conf = raw_conf < 0.48
+        if not low_conf and not folded:
+            return
+        shoulder = np.asarray(pose[shoulder_idx][:2], dtype=np.float32)
+        upper = target_lengths[(shoulder_idx, elbow_idx)]
+        lower = target_lengths[(elbow_idx, wrist_idx)]
+        target = phase_target_py(shoulder, torso, side, rec.get("phase"))
+        ik_elbow, ik_wrist = solve_arm_py(shoulder, target, upper, lower, side)
+        blend = 0.82 if raw_conf < 0.28 else 0.58
+        if not current_ok:
+            pose[elbow_idx] = [round(float(ik_elbow[0]), 2), round(float(ik_elbow[1]), 2), 0.45]
+            pose[wrist_idx] = [round(float(ik_wrist[0]), 2), round(float(ik_wrist[1]), 2), 0.45]
+        else:
+            cur_elbow = np.asarray(pose[elbow_idx][:2], dtype=np.float32)
+            cur_wrist = np.asarray(pose[wrist_idx][:2], dtype=np.float32)
+            out_elbow = cur_elbow * (1.0 - blend) + ik_elbow * blend
+            out_wrist = cur_wrist * (1.0 - blend) + ik_wrist * blend
+            pose[elbow_idx] = [round(float(out_elbow[0]), 2), round(float(out_elbow[1]), 2), round(max(float(pose[elbow_idx][2]), 0.45), 3)]
+            pose[wrist_idx] = [round(float(out_wrist[0]), 2), round(float(out_wrist[1]), 2), round(max(float(pose[wrist_idx][2]), 0.45), 3)]
+        rec["active_arm_reconstructed"] = True
+
+    for rec in records:
+        raw_pose = rec.get("pose2d") or []
+        stable = [p.copy() if p is not None else None for p in raw_pose]
+        if len(stable) < 29:
+            stable.extend([None] * (29 - len(stable)))
+        torso = max(float(rec.get("torso_length_px") or default_torso), 45.0)
+        phase = rec.get("phase")
+        display_side = rec.get("stable_active_side") or rec.get("active_side")
+        active_wrist = 15 if display_side == "left" else 16
+        active_elbow = 13 if display_side == "left" else 14
+
+        for idx in keypoints:
+            raw = raw_pose[idx] if idx < len(raw_pose) else None
+            prev = prev_pose[idx] if prev_pose is not None and idx < len(prev_pose) else None
+            if not valid(raw):
+                missing[idx] += 1
+                if valid(prev) and missing[idx] <= int(max(3, fps * 0.18)):
+                    velocity = prev_velocity.get(idx, np.zeros(2, dtype=np.float32))
+                    predicted = np.asarray(prev[:2], dtype=np.float32) + velocity * 0.35
+                    stable[idx] = [round(float(predicted[0]), 2), round(float(predicted[1]), 2), round(max(0.0, float(prev[2]) * 0.72), 3)]
+                else:
+                    stable[idx] = None
+                continue
+
+            missing[idx] = 0
+            cur = np.asarray(raw[:2], dtype=np.float32)
+            vis = float(raw[2])
+            if not valid(prev):
+                stable[idx] = [round(float(cur[0]), 2), round(float(cur[1]), 2), round(vis, 3)]
+                continue
+
+            prev_xy = np.asarray(prev[:2], dtype=np.float32)
+            speed_hint = float(np.linalg.norm(cur - prev_xy)) / torso
+            high_speed_phase = phase in {"drive", "contact", "follow"}
+            if idx == active_wrist and high_speed_phase and vis >= 0.45:
+                alpha = 0.72
+                max_step = torso * 1.28
+            elif idx == active_elbow and high_speed_phase and vis >= 0.45:
+                alpha = 0.54
+                max_step = torso * 0.74
+            elif idx in wrist_points and high_speed_phase and vis >= 0.45:
+                alpha = 0.30
+                max_step = torso * 0.42
+            elif idx in arm_points:
+                alpha = 0.44 if vis >= 0.55 else 0.24
+                max_step = torso * (0.70 if vis >= 0.55 else 0.32)
+            else:
+                alpha = 0.36 if vis >= 0.55 else 0.22
+                max_step = torso * (0.52 if vis >= 0.55 else 0.25)
+
+            if speed_hint > 1.15 and vis < 0.55:
+                alpha *= 0.55
+                max_step *= 0.72
+            limited = clamp_step(prev_xy, cur, max_step)
+            smoothed = prev_xy * (1.0 - alpha) + limited * alpha
+            stable[idx] = [round(float(smoothed[0]), 2), round(float(smoothed[1]), 2), round(max(vis, float(prev[2]) * 0.88 if vis < 0.25 else vis), 3)]
+            prev_velocity[idx] = smoothed - prev_xy
+
+        if enable_arm_reconstruction:
+            reconstruct_active_arm_if_needed(stable, raw_pose, rec, torso)
+        for a, b in arm_bones:
+            enforce_bone(stable, a, b, target_lengths[(a, b)])
+        for idx in keypoints:
+            if stable[idx] is not None:
+                stable[idx][2] = round(float(max(0.0, min(1.0, stable[idx][2]))), 3)
+        rec["pose2d"] = stable
+        prev_pose = [p.copy() if p is not None else None for p in stable]
+
+    # Offline reports can use a centered pass. This removes the visible "buzz"
+    # that remains after causal smoothing while keeping the real swing direction.
+    half_window = int(max(2, min(5, round(fps * 0.12))))
+    original_stable = [[p.copy() if p is not None else None for p in (rec.get("pose2d") or [])] for rec in records]
+
+    def centered_average(frame_idx, kp_idx, window):
+        values = []
+        for j in range(max(0, frame_idx - window), min(len(records), frame_idx + window + 1)):
+            pose = original_stable[j]
+            if kp_idx >= len(pose) or not valid(pose[kp_idx], 0.12):
+                continue
+            dist = abs(j - frame_idx)
+            temporal = 1.0 / (1.0 + dist * 0.65)
+            conf = max(0.12, float(pose[kp_idx][2]))
+            values.append((np.asarray(pose[kp_idx][:2], dtype=np.float32), temporal * conf, conf))
+        if not values:
+            return None
+        total = sum(w for _, w, _ in values)
+        xy = sum(v * w for v, w, _ in values) / max(total, 1e-6)
+        conf = max(c for _, _, c in values)
+        return xy, conf
+
+    for i, rec in enumerate(records):
+        pose = [p.copy() if p is not None else None for p in original_stable[i]]
+        if len(pose) < 29:
+            pose.extend([None] * (29 - len(pose)))
+        torso = max(float(rec.get("torso_length_px") or default_torso), 45.0)
+        display_side = rec.get("stable_active_side") or rec.get("active_side")
+        active_wrist = 15 if display_side == "left" else 16
+        high_speed_phase = rec.get("phase") in {"drive", "contact", "follow"}
+        for idx in keypoints:
+            cur = original_stable[i][idx] if idx < len(original_stable[i]) else None
+            if not valid(cur, 0.12):
+                continue
+            if idx == active_wrist and high_speed_phase:
+                window = max(1, half_window - 2)
+                blend = 0.30
+                max_adjust = torso * 0.22
+            elif idx in arm_points:
+                window = half_window
+                blend = 0.56
+                max_adjust = torso * 0.18
+            else:
+                window = max(2, half_window - 1)
+                blend = 0.38
+                max_adjust = torso * 0.14
+            averaged = centered_average(i, idx, window)
+            if averaged is None:
+                continue
+            avg_xy, conf = averaged
+            cur_xy = np.asarray(cur[:2], dtype=np.float32)
+            delta = avg_xy - cur_xy
+            norm = float(np.linalg.norm(delta))
+            if norm > max_adjust and norm > 1e-6:
+                avg_xy = cur_xy + delta / norm * max_adjust
+            out_xy = cur_xy * (1.0 - blend) + avg_xy * blend
+            pose[idx] = [round(float(out_xy[0]), 2), round(float(out_xy[1]), 2), round(float(max(cur[2], conf * 0.92)), 3)]
+        for _ in range(2):
+            for a, b in arm_bones:
+                enforce_bone(pose, a, b, target_lengths[(a, b)])
+        for idx in keypoints:
+            if pose[idx] is not None:
+                pose[idx][2] = round(float(max(0.0, min(1.0, pose[idx][2]))), 3)
+        rec["pose2d"] = pose
+    return records
 
 
 def frame_metrics(frame, fps, idx, left_speed, right_speed, events):
@@ -300,6 +662,52 @@ def frame_metrics(frame, fps, idx, left_speed, right_speed, events):
     }
 
 
+def enrich_strike_context(records, strike_events, power_events, fps):
+    power_set = set(power_events)
+    if not strike_events:
+        for rec in records:
+            rec["strike_index"] = None
+            rec["nearest_strike_frame"] = None
+            rec["nearest_strike_time_sec"] = None
+            rec["strike_kind"] = None
+        return records, []
+
+    strike_summaries = []
+    for i, frame_idx in enumerate(strike_events):
+        rec = records[frame_idx]
+        speed_body = float(rec.get("normalized_wrist_speed_body_s") or 0.0)
+        elbow_speed = float(rec.get("elbow_angular_speed_deg_s") or 0.0)
+        kind = "power" if frame_idx in power_set else "candidate"
+        if kind != "power":
+            if speed_body >= 3.2 or elbow_speed >= 720:
+                label = "快速击球"
+            elif float(rec.get("wrist_above_shoulder_px") or 0.0) < -18:
+                label = "低手处理"
+            else:
+                label = "击球"
+        else:
+            label = "重发力窗口"
+        strike_summaries.append({
+            "index": i,
+            "frame": frame_idx,
+            "time_sec": rec.get("time_sec"),
+            "kind": kind,
+            "label": label,
+            "active_side": rec.get("active_side"),
+            "wrist_speed_body_s": round(speed_body, 2),
+            "wrist_speed_px_s": rec.get("wrist_speed_px_s"),
+        })
+
+    for rec in records:
+        nearest = min(strike_summaries, key=lambda item: abs(item["frame"] - rec["frame"]))
+        rec["strike_index"] = nearest["index"]
+        rec["nearest_strike_frame"] = nearest["frame"]
+        rec["nearest_strike_time_sec"] = nearest["time_sec"]
+        rec["strike_kind"] = nearest["kind"]
+        rec["strike_distance_sec"] = round(abs(rec["frame"] - nearest["frame"]) / max(fps, 1.0), 3)
+    return records, strike_summaries
+
+
 def summarize_event(records, event_frame, fps):
     start = max(0, int(event_frame - fps * 0.65))
     end = min(len(records) - 1, int(event_frame + fps * 0.65))
@@ -324,7 +732,7 @@ def summarize_event(records, event_frame, fps):
         "event_type": "power_action",
         "event_label": "重发力窗口",
         "window": [start, end],
-        "active_side": contact["active_side"],
+        "active_side": contact.get("stable_active_side") or contact["active_side"],
         "peak_wrist_speed_px_s": peak["wrist_speed_px_s"],
         "peak_frame": peak["frame"],
         "contact_elbow_angle_deg": contact["elbow_angle_deg"],
@@ -694,7 +1102,7 @@ def enrich_realtime_metrics(records, events, fps):
             "event_type": "power_action",
             "event_label": "重发力窗口",
             "window": [start, end],
-            "active_side": contact.get("active_side"),
+            "active_side": contact.get("stable_active_side") or contact.get("active_side"),
             "phase_label": "重发力评分",
             "timing_score": quality["timing_score"],
             "chain_score": quality["chain_score"],
@@ -740,29 +1148,29 @@ def enrich_realtime_metrics(records, events, fps):
 
 
 def draw_skeleton(frame, rec, raw_frame):
-    pose = raw_frame.get("pose") or []
+    pose = rec.get("pose2d") or compact_pose(raw_frame)
     phase = rec["phase"]
     color = PHASE_COLORS.get(phase, (160, 160, 160))
     overlay = frame.copy()
     for a, b in POSE_CONNECTIONS:
         if a >= len(pose) or b >= len(pose) or pose[a] is None or pose[b] is None:
             continue
-        va = float(pose[a].get("visibility", 1.0))
-        vb = float(pose[b].get("visibility", 1.0))
+        va = float(pose[a][2])
+        vb = float(pose[b][2])
         if min(va, vb) < 0.18:
             continue
-        pa = tuple(np.round([pose[a]["px"], pose[a]["py"]]).astype(int))
-        pb = tuple(np.round([pose[b]["px"], pose[b]["py"]]).astype(int))
+        pa = tuple(np.round([pose[a][0], pose[a][1]]).astype(int))
+        pb = tuple(np.round([pose[b][0], pose[b][1]]).astype(int))
         cv2.line(overlay, pa, pb, color, 6, cv2.LINE_AA)
         cv2.line(frame, pa, pb, (20, 24, 32), 2, cv2.LINE_AA)
     cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
     for idx, p in enumerate(pose):
         if p is None:
             continue
-        vis = float(p.get("visibility", 1.0))
+        vis = float(p[2])
         if vis < 0.18:
             continue
-        center = tuple(np.round([p["px"], p["py"]]).astype(int))
+        center = tuple(np.round([p[0], p[1]]).astype(int))
         radius = 7 if idx in {13, 14, 15, 16} else 5
         cv2.circle(frame, center, radius + 2, (20, 24, 32), -1, cv2.LINE_AA)
         cv2.circle(frame, center, radius, (255, 90, 210), -1, cv2.LINE_AA)
@@ -1028,9 +1436,13 @@ def write_html(payload, report_path, video_name, overlay_name):
     .panelHead { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
     video { width:100%; background:#05070a; border:1px solid rgba(215,248,223,.32); border-radius:6px; }
     a { color:var(--accent); }
+    .viewStack { min-width:0; }
+    .viewLabel { display:flex; align-items:center; justify-content:space-between; gap:8px; color:#cde4d8; font-size:12px; margin:0 0 6px; }
     .player { position:relative; width:100%; }
     .player video { display:block; }
     #poseCanvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+    .referencePlayer { position:relative; width:100%; aspect-ratio:16/9; border:1px solid rgba(215,248,223,.32); border-radius:6px; overflow:hidden; background:#06100e; }
+    #referenceCanvas { width:100%; height:100%; display:block; }
     .actionPanel { padding:12px; display:flex; flex-direction:column; gap:10px; }
     .stageCard { border:1px solid rgba(157,242,194,.5); border-radius:8px; padding:12px; background:linear-gradient(135deg, rgba(15,122,76,.45), rgba(8,17,15,.92)); }
     .stageCard span, .live > span, .metric span { display:block; color:var(--muted); font-size:12px; margin-bottom:7px; }
@@ -1064,6 +1476,10 @@ def write_html(payload, report_path, video_name, overlay_name):
     .note { color:var(--muted); font-size:12px; line-height:1.45; margin:0; }
     .timelinePanel { grid-column:1 / -1; padding:10px; }
     #timeline { width:100%; height:86px; min-height:64px; border:1px solid var(--line); border-radius:6px; background:#07110f; display:block; touch-action:none; cursor:pointer; }
+    .playbackTools { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .toolLabel { display:inline-flex; align-items:center; gap:7px; color:#cde4d8; font-size:12px; }
+    .toolLabel select { color:#f2fff7; background:#0b1714; border:1px solid var(--line); border-radius:6px; padding:6px 8px; outline:none; }
+    .speedBadge { color:#fff8c4; border:1px solid rgba(246,213,106,.38); background:rgba(246,213,106,.10); border-radius:999px; padding:6px 10px; font-size:12px; font-variant-numeric:tabular-nums; }
     .legend { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
     .legend span { display:inline-flex; align-items:center; gap:5px; color:#cde4d8; font-size:12px; }
     .dot { width:9px; height:9px; border-radius:50%; display:inline-block; }
@@ -1102,6 +1518,9 @@ def write_html(payload, report_path, video_name, overlay_name):
       .actionPanel .note { display:none; }
       #timeline { height:74px; }
     }
+    @media(max-width:520px){
+      .comparisonGrid { grid-template-columns:1fr; }
+    }
   </style>
 </head>
 <body>
@@ -1125,12 +1544,15 @@ def write_html(payload, report_path, video_name, overlay_name):
   <main>
     <section class="videoPanel">
       <div class="panelHead">
-        <h2>视频 + 2D 骨架</h2>
+        <h2>视频 + 稳定 2D 骨架</h2>
         <span class="chip">动作复盘</span>
       </div>
-      <div class="player">
-        <video id="sourceVideo" src="__VIDEO__" controls muted playsinline preload="auto"></video>
-        <canvas id="poseCanvas"></canvas>
+      <div class="viewStack">
+        <div class="viewLabel"><span>用户原视频</span><span>真实动作</span></div>
+        <div class="player">
+          <video id="sourceVideo" src="__VIDEO__" controls muted playsinline preload="auto"></video>
+          <canvas id="poseCanvas"></canvas>
+        </div>
       </div>
     </section>
     <aside class="actionPanel">
@@ -1142,11 +1564,21 @@ def write_html(payload, report_path, video_name, overlay_name):
         <div class="live chain"><span>发力链</span><div class="scoreRow"><strong><span id="chainScoreNow" class="scoreValue">-</span><span class="unit">/100</span></strong></div><div class="scoreBar"><i id="chainBar"></i></div></div>
         <div class="live recovery"><span>回位恢复</span><div class="scoreRow"><strong><span id="recoveryScoreNow" class="scoreValue">-</span><span class="unit">/100</span></strong></div><div class="scoreBar"><i id="recoveryBar"></i></div></div>
       </div>
-      <p class="note">三项分数来自明显重发力窗口，并保持到下一次重发力。放网、轻挡、过渡球可能不会单独计数；这里不是全部击球次数。</p>
+      <p class="note">当前先只统计重发力窗口，避免把轻挡、随挥和遮挡抖动计入击球次数。</p>
     </aside>
     <section class="timelinePanel">
       <div class="panelHead"><h2>动作时间轴</h2><span class="chip">点击或拖动跳转</span></div>
       <canvas id="timeline" width="1200" height="96"></canvas>
+      <div class="playbackTools">
+        <label class="toolLabel">重发力慢放
+          <select id="slowMode">
+            <option value="off">关闭</option>
+            <option value="0.5" selected>0.5x</option>
+            <option value="0.2">0.2x</option>
+          </select>
+        </label>
+        <span id="speedBadge" class="speedBadge">1.00x</span>
+      </div>
       <div class="legend">
         <span><i class="dot" style="background:#667085"></i>准备</span>
         <span><i class="dot" style="background:#f6b84d"></i>引拍</span>
@@ -1154,6 +1586,8 @@ def write_html(payload, report_path, video_name, overlay_name):
         <span><i class="dot" style="background:#ff6961"></i>发力点</span>
         <span><i class="dot" style="background:#c084fc"></i>随挥</span>
         <span><i class="dot" style="background:#42d392"></i>回位</span>
+        <span><i class="dot" style="background:#f6d56a"></i>重发力定位</span>
+        <span><i class="dot" style="background:#f2fff7"></i>重发力</span>
       </div>
     </section>
     <section class="detailsPanel">
@@ -1162,7 +1596,7 @@ def write_html(payload, report_path, video_name, overlay_name):
         <div class="metrics">
           <div class="metric"><span>Pose 覆盖率</span><strong id="poseCoverage"></strong></div>
           <div class="metric"><span>分析模式</span><strong>Pose only</strong></div>
-          <div class="metric"><span>指标口径</span><strong>重发力窗口 0-100</strong></div>
+          <div class="metric"><span>指标口径</span><strong>重发力定位 + 三项评分</strong></div>
         </div>
         <table>
           <thead><tr><th>核心分数</th><th>当前口径</th></tr></thead>
@@ -1180,14 +1614,18 @@ def write_html(payload, report_path, video_name, overlay_name):
 <script>
 const data = JSON.parse(document.getElementById('review-data').textContent);
 const src = document.getElementById('sourceVideo'), poseCanvas = document.getElementById('poseCanvas'), pctx = poseCanvas.getContext('2d');
+const referenceCanvas = document.getElementById('referenceCanvas'), rctx = referenceCanvas ? referenceCanvas.getContext('2d') : null;
 const timeline = document.getElementById('timeline'), tctx = timeline.getContext('2d');
 const landing = document.getElementById('landing'), reviewApp = document.getElementById('reviewApp');
 const uploadInput = document.getElementById('uploadVideo'), uploadName = document.getElementById('uploadName'), startReview = document.getElementById('startReview');
+const slowMode = document.getElementById('slowMode'), speedBadge = document.getElementById('speedBadge');
 const phaseColors = {ready:'#667085', backswing:'#f6b84d', drive:'#59d7ff', contact:'#ff6961', follow:'#c084fc', recover:'#42d392'};
 const phaseLabels = {ready:'准备', backswing:'引拍', drive:'蹬转加速', contact:'发力点', follow:'随挥', recover:'回位'};
 document.getElementById('poseCoverage').textContent = (data.summary.pose_coverage*100).toFixed(1)+'%';
+const poseDisplayFrameOffset = Number(data.summary.pose_display_frame_offset || 0);
 let selectedFrame = 0;
 let seekToken = 0;
+let smoothRate = 1;
 function cancelPendingSeek(){ seekToken += 1; }
 function setVideoTime(video, t){
   const token = ++seekToken;
@@ -1210,18 +1648,125 @@ function drawTimeline(active=0){
   const duration=data.records[data.records.length-1].time_sec || 0;
   const tickStep=duration>16?5:2;
   for(let t=0;t<=duration+.01;t+=tickStep){ const x=t/duration*w; tctx.fillRect(x,62,1,8); tctx.fillText(Math.round(t)+'s',Math.min(w-26,x+4),78); }
+  for(const ev of data.summary.strike_frames || []){ const x=ev/(n-1)*w; tctx.fillStyle='#f6d56a'; tctx.globalAlpha=.92; tctx.fillRect(x,18,1,42); tctx.beginPath(); tctx.arc(x,60,3,0,Math.PI*2); tctx.fill(); }
+  tctx.globalAlpha=1;
   for(const ev of data.summary.event_frames || []){ const x=ev/(n-1)*w; tctx.fillStyle='#f2fff7'; tctx.fillRect(x-1,13,2,50); tctx.beginPath(); tctx.arc(x,13,5,0,Math.PI*2); tctx.fill(); }
   const x=active/(n-1)*w; tctx.fillStyle='#fff8c4'; tctx.fillRect(x-2,6,4,68);
 }
 function fmtScore(v){ return v===null || v===undefined || !Number.isFinite(Number(v)) ? '-' : Math.round(Number(v)); }
 function setScore(id, barId, value){ const n=Number(value); const ok=Number.isFinite(n); document.getElementById(id).textContent = ok ? Math.round(n) : '-'; document.getElementById(barId).style.width = ok ? Math.max(0, Math.min(100, n))+'%' : '0%'; }
-function drawInfo(frame){ const r=data.records[frame], s=r.stroke_metrics || {}; const phase=phaseLabels[r.phase] || r.phase; const stroke=(r.stroke_index ?? 0)+1; document.getElementById('phaseNow').textContent = phase; document.getElementById('strokeNow').textContent = '第 '+stroke+' 次重发力'; document.getElementById('timeNow').textContent = Number(r.time_sec || 0).toFixed(2)+'s'; setScore('timingScoreNow','timingBar',s.timing_score); setScore('chainScoreNow','chainBar',s.chain_score); setScore('recoveryScoreNow','recoveryBar',s.recovery_score); }
+function drawInfo(frame){ const r=data.records[frame], s=r.stroke_metrics || {}; const phase=phaseLabels[r.phase] || r.phase; const power=(r.stroke_index ?? null); const nearPower=r.strike_kind==='power' && Number(r.strike_distance_sec || 99) <= 0.65 && power !== null; let label='未检测到重发力'; if(r.strike_index !== null && r.strike_index !== undefined){ const strike=Number(r.strike_index)+1; label=nearPower?'第 '+strike+' 次重发力 #'+(power+1):'第 '+strike+' 次重发力'; } document.getElementById('phaseNow').textContent = phase; document.getElementById('strokeNow').textContent = label; document.getElementById('timeNow').textContent = Number(r.time_sec || 0).toFixed(2)+'s'; setScore('timingScoreNow','timingBar',s.timing_score); setScore('chainScoreNow','chainBar',s.chain_score); setScore('recoveryScoreNow','recoveryBar',s.recovery_score); }
 function resizePoseCanvas(){ if(!src.videoWidth || !src.videoHeight) return; poseCanvas.width = src.videoWidth; poseCanvas.height = src.videoHeight; }
 function drawPoseOverlay(frame){ resizePoseCanvas(); pctx.clearRect(0,0,poseCanvas.width,poseCanvas.height); const r=data.records[frame], pose=r.pose2d || []; const color=phaseColors[r.phase] || '#94a3b8'; pctx.lineCap='round'; pctx.lineJoin='round'; for(const [a,b] of data.pose_connections){ const A=pose[a], B=pose[b]; if(!A||!B||Math.min(A[2],B[2])<0.18) continue; pctx.strokeStyle=color; pctx.lineWidth=6; pctx.beginPath(); pctx.moveTo(A[0],A[1]); pctx.lineTo(B[0],B[1]); pctx.stroke(); } pose.forEach((p,i)=>{ if(!p||p[2]<0.18) return; const key=[13,14,15,16,25,26].includes(i); pctx.fillStyle=key?'#f6d56a':'#f2fff7'; const rad=key?7:5; pctx.beginPath(); pctx.arc(p[0],p[1],rad,0,Math.PI*2); pctx.fill(); }); }
-function drawAll(frame){ drawTimeline(frame); drawInfo(frame); drawPoseOverlay(frame); }
+function pxy(p){ return p ? {x:Number(p[0]), y:Number(p[1]), v:Number(p[2] ?? 1)} : null; }
+function clonePose(pose){ return (pose || []).map(p => p ? [Number(p[0]), Number(p[1]), Number(p[2] ?? 1)] : null); }
+function dist2(a,b){ return (!a||!b) ? 0 : Math.hypot(a.x-b.x, a.y-b.y); }
+function mid2(a,b){ return (!a||!b) ? null : {x:(a.x+b.x)/2, y:(a.y+b.y)/2, v:Math.min(a.v ?? 1,b.v ?? 1)}; }
+function clampNum(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function solveArm2d(shoulder, target, upper, lower, bendSign){
+  const dx=target.x-shoulder.x, dy=target.y-shoulder.y;
+  let d=Math.hypot(dx,dy);
+  if(d < 1e-3) d = 1e-3;
+  const maxReach = Math.max(upper + lower - 2, 12);
+  const minReach = Math.max(Math.abs(upper - lower) + 2, 10);
+  const scale = clampNum(d, minReach, maxReach) / d;
+  const tx = shoulder.x + dx * scale, ty = shoulder.y + dy * scale;
+  d = Math.hypot(tx-shoulder.x, ty-shoulder.y);
+  const a = clampNum((upper*upper - lower*lower + d*d) / (2*d), 0, upper);
+  const h = Math.sqrt(Math.max(0, upper*upper - a*a));
+  const ux = (tx-shoulder.x)/d, uy = (ty-shoulder.y)/d;
+  const base = {x:shoulder.x + ux*a, y:shoulder.y + uy*a};
+  return {
+    elbow:{x:base.x + (-uy)*h*bendSign, y:base.y + ux*h*bendSign},
+    wrist:{x:tx, y:ty}
+  };
+}
+function smoothStep(t){ t=clampNum(t,0,1); return t*t*(3-2*t); }
+function mix2(a,b,t){ return [a[0]*(1-t)+b[0]*t, a[1]*(1-t)+b[1]*t]; }
+function targetSpecFromEventProgress(rec){
+  const eventFrame = Number(rec.nearest_strike_frame ?? rec.frame);
+  const fps = Number(data.summary.fps || 30);
+  const dt = (Number(rec.frame || 0) - eventFrame) / Math.max(1, fps);
+  const keys = [
+    [-1.00, [0.14, 0.18]],
+    [-0.58, [0.48, -0.50]],
+    [-0.22, [0.46, -0.78]],
+    [0.00, [0.34, -0.96]],
+    [0.30, [-0.20, -0.04]],
+    [0.70, [-0.36, 0.26]],
+    [1.10, [0.10, 0.18]],
+  ];
+  if(dt <= keys[0][0]) return keys[0][1];
+  for(let i=0;i<keys.length-1;i++){
+    const [ta,va]=keys[i], [tb,vb]=keys[i+1];
+    if(dt <= tb){
+      return mix2(va,vb,smoothStep((dt-ta)/(tb-ta)));
+    }
+  }
+  return keys[keys.length-1][1];
+}
+function phaseTarget(shoulder, torso, sideSign, rec){
+  const spec = targetSpecFromEventProgress(rec);
+  return {x:shoulder.x + sideSign * torso * spec[0], y:shoulder.y + torso * spec[1]};
+}
+function makeReferencePose(frame){
+  const rec=data.records[frame] || {}, pose=clonePose(rec.pose2d || []);
+  if(!pose.length) return pose;
+  const lsh=pxy(pose[11]), rsh=pxy(pose[12]), lhp=pxy(pose[23]), rhp=pxy(pose[24]);
+  const shoulderMid=mid2(lsh,rsh), hipMid=mid2(lhp,rhp);
+  const torso=Math.max(52, dist2(shoulderMid, hipMid) || 72);
+  const active=(rec.stable_active_side || rec.active_side) === 'left' ? 'left' : 'right';
+  const sideSign=active === 'left' ? -1 : 1;
+  const shoulderIdx=active === 'left' ? 11 : 12;
+  const elbowIdx=active === 'left' ? 13 : 14;
+  const wristIdx=active === 'left' ? 15 : 16;
+  const oppWristIdx=active === 'left' ? 16 : 15;
+  const sh=pxy(pose[shoulderIdx]);
+  if(!sh) return pose;
+  const oldEl=pxy(pose[elbowIdx]), oldWr=pxy(pose[wristIdx]);
+  const upper=clampNum(dist2(sh, oldEl) || torso*0.46, torso*0.34, torso*0.62);
+  const lower=clampNum(dist2(oldEl, oldWr) || torso*0.48, torso*0.34, torso*0.66);
+  const target=phaseTarget(sh, torso, sideSign, rec);
+  const arm=solveArm2d(sh, target, upper, lower, sideSign);
+  pose[elbowIdx]=[arm.elbow.x, arm.elbow.y, 1];
+  pose[wristIdx]=[arm.wrist.x, arm.wrist.y, 1];
+  if(pose[oppWristIdx] && shoulderMid){
+    const p=pxy(pose[oppWristIdx]);
+    const balanceX=shoulderMid.x - sideSign*torso*0.30;
+    const balanceY=shoulderMid.y + (rec.phase === 'backswing' || rec.phase === 'drive' ? -torso*0.10 : torso*0.18);
+    pose[oppWristIdx]=[p.x*0.58 + balanceX*0.42, p.y*0.58 + balanceY*0.42, Math.max(0.65,p.v)];
+  }
+  return pose;
+}
+function drawReferenceBackground(w,h){
+  rctx.fillStyle='#06100e'; rctx.fillRect(0,0,w,h);
+  rctx.strokeStyle='rgba(157,242,194,.13)'; rctx.lineWidth=1;
+  for(let x=0;x<=w;x+=Math.max(48,w/12)){ rctx.beginPath(); rctx.moveTo(x,0); rctx.lineTo(x,h); rctx.stroke(); }
+  for(let y=0;y<=h;y+=Math.max(42,h/8)){ rctx.beginPath(); rctx.moveTo(0,y); rctx.lineTo(w,y); rctx.stroke(); }
+  rctx.strokeStyle='rgba(246,213,106,.22)'; rctx.lineWidth=2; rctx.strokeRect(w*.12,h*.18,w*.76,h*.64);
+}
+function drawReferencePose(frame){
+  if(!referenceCanvas || !rctx) return;
+  if(src.videoWidth && src.videoHeight && (referenceCanvas.width!==src.videoWidth || referenceCanvas.height!==src.videoHeight)){
+    referenceCanvas.width=src.videoWidth; referenceCanvas.height=src.videoHeight;
+  }
+  const w=referenceCanvas.width, h=referenceCanvas.height;
+  drawReferenceBackground(w,h);
+  const rec=data.records[frame] || {}, pose=makeReferencePose(frame);
+  const color=phaseColors[rec.phase] || '#9df2c2';
+  rctx.lineCap='round'; rctx.lineJoin='round';
+  rctx.strokeStyle='rgba(157,242,194,.20)'; rctx.lineWidth=10;
+  for(const [a,b] of data.pose_connections){ const A=pose[a], B=pose[b]; if(!A||!B||Math.min(A[2],B[2])<0.18) continue; rctx.beginPath(); rctx.moveTo(A[0],A[1]); rctx.lineTo(B[0],B[1]); rctx.stroke(); }
+  for(const [a,b] of data.pose_connections){ const A=pose[a], B=pose[b]; if(!A||!B||Math.min(A[2],B[2])<0.18) continue; rctx.strokeStyle=color; rctx.lineWidth=5; rctx.beginPath(); rctx.moveTo(A[0],A[1]); rctx.lineTo(B[0],B[1]); rctx.stroke(); }
+  pose.forEach((p,i)=>{ if(!p||p[2]<0.18) return; const key=[13,14,15,16,25,26].includes(i); rctx.fillStyle=key?'#f6d56a':'#f2fff7'; rctx.beginPath(); rctx.arc(p[0],p[1],key?6:4,0,Math.PI*2); rctx.fill(); });
+  rctx.fillStyle='rgba(242,255,247,.78)'; rctx.font='13px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+  rctx.fillText('参考骨架会保留移动与节奏，只修正持拍侧发力关系', 14, 24);
+}
+function drawAll(frame){ drawTimeline(frame); drawInfo(frame); drawPoseOverlay(frame); drawReferencePose(frame); }
 let lastUiFrame = -1;
 function drawPlaybackFrame(frame){
   drawPoseOverlay(frame);
+  drawReferencePose(frame);
   const current = data.records[frame] || {};
   const previous = data.records[lastUiFrame] || {};
   const shouldUpdateUi = lastUiFrame < 0 || Math.abs(frame - lastUiFrame) >= 3 || current.phase !== previous.phase || current.stroke_index !== previous.stroke_index;
@@ -1232,7 +1777,47 @@ function drawPlaybackFrame(frame){
   }
 }
 function frameFromMediaTime(mediaTime){
-  return Math.min(data.records.length-1, Math.max(0, Math.round(Number(mediaTime || 0)*data.summary.fps)));
+  const fps = Number(data.summary.fps || 30);
+  const frame = Math.floor(Number(mediaTime || 0) * fps + 0.5 + poseDisplayFrameOffset);
+  return Math.min(data.records.length-1, Math.max(0, frame));
+}
+function nearestPowerDistanceSec(timeSec){
+  const fps = Number(data.summary.fps || 30);
+  const frame = Math.round(Number(timeSec || 0) * fps);
+  const events = data.summary.event_frames || [];
+  if(!events.length) return Infinity;
+  let best = Infinity;
+  for(const eventFrame of events){
+    const dist = Math.abs(eventFrame - frame) / Math.max(1, fps);
+    if(dist < best) best = dist;
+    if(best <= 0.02) break;
+  }
+  return best;
+}
+function targetPlaybackRate(timeSec){
+  if(!slowMode || slowMode.value === 'off') return 1;
+  const slow = Number(slowMode.value || 1);
+  if(!Number.isFinite(slow) || slow <= 0) return 1;
+  const dist = nearestPowerDistanceSec(timeSec);
+  if(dist <= 0.28) return slow;
+  if(dist <= 0.52){
+    const mix = (0.52 - dist) / 0.24;
+    return 1 - (1 - slow) * mix;
+  }
+  return 1;
+}
+function updatePlaybackRate(){
+  if(src.paused || scrubbing || initializing){
+    speedBadge.textContent = src.playbackRate.toFixed(2)+'x';
+    return;
+  }
+  const target = targetPlaybackRate(src.currentTime);
+  smoothRate += (target - smoothRate) * 0.16;
+  const next = Math.max(0.16, Math.min(1.05, smoothRate));
+  if(Math.abs(src.playbackRate - next) > 0.015){
+    src.playbackRate = next;
+  }
+  speedBadge.textContent = src.playbackRate.toFixed(2)+'x';
 }
 function frameFromPointer(e){ const r=timeline.getBoundingClientRect(); return Math.round((e.clientX-r.left)/r.width*(data.records.length-1)); }
 let scrubbing=false;
@@ -1252,11 +1837,13 @@ function drawSynced(mediaTime){
 }
 function animationLoop(){
   drawSynced(src.currentTime);
+  updatePlaybackRate();
   requestAnimationFrame(animationLoop);
 }
 function videoFrameLoop(now, metadata){
   const mediaTime = metadata && Number.isFinite(metadata.mediaTime) ? metadata.mediaTime : src.currentTime;
   drawSynced(mediaTime);
+  updatePlaybackRate();
   src.requestVideoFrameCallback(videoFrameLoop);
 }
 if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
@@ -1264,15 +1851,21 @@ if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
 } else {
   requestAnimationFrame(animationLoop);
 }
-src.addEventListener('play', () => { cancelPendingSeek(); src.playbackRate = 1; });
+src.addEventListener('play', () => { cancelPendingSeek(); smoothRate = src.playbackRate || 1; updatePlaybackRate(); });
+src.addEventListener('pause', () => { speedBadge.textContent = src.playbackRate.toFixed(2)+'x'; });
 src.addEventListener('seeking', cancelPendingSeek);
 src.addEventListener('seeked', () => { const frame=frameFromMediaTime(src.currentTime); selectedFrame=frame; lastDrawnFrame=frame; drawAll(frame); });
-window.addEventListener('resize',()=>{ const frame=frameFromMediaTime(src.currentTime); drawPoseOverlay(frame); });
+slowMode.addEventListener('change', () => { smoothRate = Math.min(1, Math.max(0.2, src.playbackRate || 1)); updatePlaybackRate(); });
+window.addEventListener('resize',()=>{ const frame=frameFromMediaTime(src.currentTime); drawPoseOverlay(frame); drawReferencePose(frame); });
 const requestedFrame = Number(new URLSearchParams(location.search).get('frame'));
 const initialFrame = Number.isFinite(requestedFrame) ? Math.max(0, Math.min(data.records.length - 1, Math.round(requestedFrame))) : 0;
 selectedFrame = initialFrame;
 drawAll(initialFrame);
 setVideoTime(src, data.records[initialFrame].time_sec);
+if(new URLSearchParams(location.search).get('review') === '1'){
+  landing.hidden = true;
+  reviewApp.hidden = false;
+}
 setTimeout(() => { initializing = false; drawAll(selectedFrame); }, 900);
 uploadInput.addEventListener('change', () => {
   const file = uploadInput.files && uploadInput.files[0];
@@ -1306,6 +1899,8 @@ def main():
     parser.add_argument("--video", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--label", default="img5868")
+    parser.add_argument("--handedness", choices=["auto", "left", "right"], default="auto")
+    parser.add_argument("--arm-reconstruction", choices=["off", "on"], default="off")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -1319,11 +1914,31 @@ def main():
     left_speed = speed(left_wrist, fps)
     right_speed = speed(right_wrist, fps)
     event_scores = action_scores(raw, left_speed, right_speed)
-    events = robust_events(event_scores, fps)
+    duration_sec = len(raw) / fps if fps else 0.0
+    power_event_limit = max(8, min(24, int(math.ceil(duration_sec / 4.0))))
+    events = robust_events(event_scores, fps, limit=power_event_limit)
+    # Keep the production review conservative for now: only count heavy-power
+    # windows. The broader contact candidate pass is intentionally left out of
+    # the main statistics until it has stronger validation.
+    strike_events = list(events)
+    inferred_side, racket_side_debug = infer_racket_side(raw, left_speed, right_speed, events, fps)
+    if args.handedness == "auto":
+        racket_side = inferred_side
+    else:
+        racket_side = args.handedness
+        racket_side_debug = {
+            **racket_side_debug,
+            "inferred": inferred_side,
+            "override": args.handedness,
+            "decision": "manual_override",
+        }
 
-    records = [frame_metrics(frame, fps, idx, left_speed, right_speed, events) for idx, frame in enumerate(raw)]
+    records = [frame_metrics(frame, fps, idx, left_speed, right_speed, strike_events) for idx, frame in enumerate(raw)]
+    records = assign_stable_active_side(records, racket_side)
     records, stroke_metrics = enrich_realtime_metrics(records, events, fps)
+    records, strike_summaries = enrich_strike_context(records, strike_events, events, fps)
     event_summaries = [summarize_event(records, idx, fps) for idx in events]
+    records = stabilize_display_pose(records, fps, enable_arm_reconstruction=args.arm_reconstruction == "on")
 
     video_src = Path(args.video).resolve()
     video_dst = out_dir / video_src.name
@@ -1339,9 +1954,20 @@ def main():
         "duration_sec": round(len(records) / fps, 3) if fps else None,
         "pose_coverage": metrics.get("pose_coverage", 1.0),
         "event_frames": events,
-        "event_semantics": "明显重发力窗口，不代表全部击球次数；放网、轻挡、过渡球可能不会单独计数。",
+        "event_semantics": "明显重发力窗口，用于三项评分、时间轴定位与慢放复盘。",
         "power_action_frames": events,
         "power_action_count": len(events),
+        "power_action_limit": power_event_limit,
+        "strike_frames": strike_events,
+        "strike_count": len(strike_events),
+        "strike_detection_mode": "power_only",
+        "strike_semantics": "当前只统计重发力窗口，暂不把轻挡、抽挡、挑球等宽松候选计入主统计。",
+        "pose_stabilization": "display_only_confidence_aware_limb_length",
+        "pose_display_frame_offset": 1,
+        "racket_side": racket_side,
+        "racket_side_debug": racket_side_debug,
+        "active_arm_reconstruction": args.arm_reconstruction,
+        "active_arm_reconstructed_frames": sum(1 for rec in records if rec.get("active_arm_reconstructed")),
         "outputs": {
             "report_html": str(out_dir / f"{args.label}_2d_action_review.html"),
             "review_video": str(web_video),
@@ -1349,7 +1975,14 @@ def main():
             "review_json": str(out_dir / f"{args.label}_2d_action_review.json"),
         },
     }
-    payload = {"summary": summary, "records": records, "events": event_summaries, "stroke_metrics": stroke_metrics, "pose_connections": POSE_CONNECTIONS}
+    payload = {
+        "summary": summary,
+        "records": records,
+        "events": event_summaries,
+        "strike_events": strike_summaries,
+        "stroke_metrics": stroke_metrics,
+        "pose_connections": POSE_CONNECTIONS,
+    }
     json_path = out_dir / f"{args.label}_2d_action_review.json"
     report_path = out_dir / f"{args.label}_2d_action_review.html"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

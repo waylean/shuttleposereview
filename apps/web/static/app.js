@@ -25,12 +25,16 @@ const retryButton = document.getElementById("retryButton");
 const recentPanel = document.getElementById("recentPanel");
 const recentJobs = document.getElementById("recentJobs");
 const refreshJobsButton = document.getElementById("refreshJobsButton");
+const historyMeta = document.getElementById("historyMeta");
+const workspaceTitle = document.getElementById("workspaceTitle");
 
 const MAX_UPLOAD_BYTES = 900 * 1024 * 1024;
 const ACCEPTED_EXTENSIONS = [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"];
+const MAX_HISTORY_ITEMS = 20;
 
 let selectedFile = null;
 let pollTimer = null;
+let currentResult = null;
 
 function setFile(file) {
   selectedFile = file || null;
@@ -50,6 +54,7 @@ function resetFlow() {
   clearInterval(pollTimer);
   videoInput.value = "";
   setFile(null);
+  currentResult = null;
   overlayVideo.removeAttribute("src");
   reportFrame.removeAttribute("src");
   showOnly(uploadPanel);
@@ -187,16 +192,18 @@ function setHref(element, url) {
 
 function showResult(job) {
   showOnly(resultPanel);
-  const result = job.result || {};
-  setHref(openReport, result.report_url);
-  setHref(openOverlay, result.overlay_url);
-  setHref(openPoseOverlay, result.pose_overlay_url);
-  setHref(openJson, result.json_url);
-  setHref(openResultLog, result.log_url);
-  reportFrame.src = result.report_url || "about:blank";
-  if (result.overlay_url) {
-    overlayVideo.src = result.overlay_url;
+  currentResult = job.result || {};
+  setHref(openReport, currentResult.report_url);
+  setHref(openOverlay, currentResult.overlay_url);
+  setHref(openPoseOverlay, currentResult.pose_overlay_url);
+  setHref(openJson, currentResult.json_url);
+  setHref(openResultLog, currentResult.log_url);
+  if (currentResult.overlay_url) {
+    overlayVideo.src = currentResult.overlay_url;
   }
+  reportFrame.src = currentResult.report_url || "about:blank";
+  workspaceTitle.textContent = "动作复盘";
+  openReport.textContent = "完整页面";
   loadRecentJobs();
 }
 
@@ -219,7 +226,7 @@ function normalizeError(message) {
 
 async function loadRecentJobs() {
   try {
-    const response = await fetch("/api/jobs?limit=6");
+    const response = await fetch(`/api/jobs?limit=${MAX_HISTORY_ITEMS}`);
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
     renderRecentJobs(data.jobs || []);
@@ -230,19 +237,36 @@ async function loadRecentJobs() {
 
 function renderRecentJobs(jobs) {
   const completed = jobs.filter((job) => job.status === "completed" && job.result && job.result.report_url);
-  recentPanel.hidden = completed.length === 0;
+  recentPanel.hidden = false;
+  historyMeta.textContent = completed.length
+    ? `已保留 ${completed.length}/${MAX_HISTORY_ITEMS} 条本机复盘，点击任意记录继续查看。`
+    : `最多保留 ${MAX_HISTORY_ITEMS} 条本机复盘；完成上传后会出现在这里。`;
   recentJobs.innerHTML = "";
+  if (completed.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "recent-empty";
+    empty.textContent = "暂无历史复盘。";
+    recentJobs.appendChild(empty);
+    return;
+  }
   for (const job of completed) {
     const item = document.createElement("button");
     item.type = "button";
     item.className = "recent-item";
     item.innerHTML = `
       <span>${escapeHtml(job.filename || "未命名视频")}</span>
-      <small>${formatTime(job.completed_at || job.updated_at)}</small>
+      <small>${formatTime(job.completed_at || job.updated_at)} · ${formatDuration(job)}</small>
     `;
     item.addEventListener("click", () => showResult(job));
     recentJobs.appendChild(item);
   }
+}
+
+function formatDuration(job) {
+  const bytes = Number(job.size_bytes || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "已完成";
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))}KB`;
 }
 
 function escapeHtml(value) {

@@ -19,7 +19,7 @@
       <section class="landing" id="uploadPanel">
         <div class="hero-copy">
           <h1>把一段打球视频变成动作复盘</h1>
-          <p>上传手机录制的视频，本机后台会完成预处理、骨架提取、动作阶段识别，并生成可查看的复盘页面。</p>
+          <p>上传手机录制的视频，本机后台会完成预处理、骨架提取、动作阶段识别，并生成 2D 动作复盘报告和标注视频。</p>
         </div>
 
         <div class="upload-card">
@@ -34,7 +34,10 @@
 
         <section class="recent" id="recentPanel" hidden>
           <div class="section-title">
-            <h2>最近复盘</h2>
+            <div>
+              <h2>历史复盘</h2>
+              <p id="historyMeta">最多保留 20 条本机复盘。</p>
+            </div>
             <button class="text-button" id="refreshJobsButton" type="button">刷新</button>
           </div>
           <div class="recent-list" id="recentJobs"></div>
@@ -68,7 +71,7 @@
       <section class="result-workspace" id="resultPanel" hidden>
         <section class="review-frame-panel">
           <div class="section-title">
-            <h2>动作复盘</h2>
+            <h2 id="workspaceTitle">动作复盘</h2>
             <a id="openReport" target="_blank" rel="noreferrer">完整页面</a>
           </div>
           <iframe id="reportFrame" title="动作复盘报告"></iframe>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -24,9 +25,9 @@ UPLOAD_DIR = APP_DIR / "uploads"
 RESULT_DIR = APP_DIR / "results"
 JOB_DIR = APP_DIR / "jobs"
 SCRIPTS_DIR = REPO_ROOT / "work" / "scripts"
-
 MAX_UPLOAD_BYTES = 900 * 1024 * 1024
 ALLOWED_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+MAX_HISTORY_JOBS = 20
 
 for folder in (UPLOAD_DIR, RESULT_DIR, JOB_DIR):
     folder.mkdir(parents=True, exist_ok=True)
@@ -209,7 +210,7 @@ def process_job(job_id: str) -> None:
         run_step(
             job_id,
             "动作复盘生成",
-            76,
+            80,
             [
                 sys.executable,
                 str(SCRIPTS_DIR / "build_2d_action_review.py"),
@@ -223,6 +224,8 @@ def process_job(job_id: str) -> None:
                 str(review_dir),
                 "--label",
                 label,
+                "--handedness",
+                os.getenv("SPR_HANDEDNESS", "auto"),
             ],
         )
 
@@ -245,6 +248,7 @@ def process_job(job_id: str) -> None:
                 "log_url": f"/api/jobs/{job_id}/log",
             },
         )
+        prune_history_jobs()
     except Exception as exc:
         patch_job(
             job_id,
@@ -254,6 +258,7 @@ def process_job(job_id: str) -> None:
             progress=100,
             result={"log_url": f"/api/jobs/{job_id}/log"},
         )
+        prune_history_jobs()
 
 
 def worker_loop() -> None:
@@ -321,7 +326,7 @@ def list_jobs(limit: int = 8) -> dict[str, Any]:
             items.append(public_job(json.loads(path.read_text(encoding="utf-8"))))
         except Exception:
             continue
-        if len(items) >= max(1, min(limit, 24)):
+        if len(items) >= max(1, min(limit, MAX_HISTORY_JOBS)):
             break
     return {"jobs": items}
 
@@ -363,3 +368,27 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "result": job.get("result"),
         "error": job.get("error"),
     }
+
+
+def prune_history_jobs() -> None:
+    finished: list[dict[str, Any]] = []
+    for path in JOB_DIR.glob("*.json"):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if job.get("status") in {"completed", "failed"}:
+            finished.append(job)
+    finished.sort(key=lambda item: item.get("completed_at") or item.get("updated_at") or item.get("created_at") or "", reverse=True)
+    for job in finished[MAX_HISTORY_JOBS:]:
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        try:
+            upload_path = job.get("upload_path")
+            if upload_path:
+                Path(upload_path).unlink(missing_ok=True)
+            shutil.rmtree(RESULT_DIR / job_id, ignore_errors=True)
+            job_path(job_id).unlink(missing_ok=True)
+        except Exception:
+            continue

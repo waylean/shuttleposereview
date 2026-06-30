@@ -46,6 +46,7 @@ import android.widget.VideoView;
 
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
+import com.google.mediapipe.tasks.components.containers.Landmark;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
@@ -67,8 +68,9 @@ public class MainActivity extends Activity {
     private static final int PICK_VIDEO = 1001;
     private static final int TARGET_FPS = 15;
     private static final int MAX_DURATION_MS = 60_000;
+    private static final int MAX_HISTORY_REVIEWS = 20;
     private static final int MODEL_INPUT_MAX_WIDTH = 640;
-    private static final String CACHE_SCHEMA_VERSION = "pose-fit-v3-60s-evidence";
+    private static final String CACHE_SCHEMA_VERSION = "pose-fit-v4-60s-3d-world";
     private static final int COLOR_BG = 0xffF7F8F5;
     private static final int COLOR_SURFACE = 0xffffffff;
     private static final int COLOR_TEXT = 0xff161A17;
@@ -83,6 +85,8 @@ public class MainActivity extends Activity {
     private Button pickButton;
     private Button demoButton;
     private Button exportButton;
+    private Button slowMotionToggleButton;
+    private Button slowMotionSpeedButton;
     private LinearLayout progressCard;
     private LinearLayout resultCard;
     private TextView progressTitle;
@@ -105,9 +109,18 @@ public class MainActivity extends Activity {
     private TextView actionLevelValue;
     private TextView evidenceDetail;
     private LinearLayout timelineStrip;
+    private LinearLayout historyPanel;
+    private LinearLayout historyList;
+    private TextView historyHint;
     private CachedReview currentReview;
     private StrokeScore selectedStroke;
     private String expandedEvidenceType = "";
+    private Runnable playbackSpeedMonitor;
+    private Runnable initialPreviewPauseRunnable;
+    private android.media.MediaPlayer reviewMediaPlayer;
+    private boolean slowMotionEnabled = true;
+    private float slowMotionSpeed = 0.5f;
+    private float appliedPlaybackSpeed = 1.0f;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -245,6 +258,23 @@ public class MainActivity extends Activity {
         uploader.addView(pickButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
         content.addView(uploader, topMargin(dp(14)));
 
+        historyPanel = darkPanel();
+        LinearLayout historyTitle = row();
+        historyTitle.addView(text("历史复盘", 22, 0xffF2FFF7, Typeface.BOLD), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView historyLimit = text("最多 " + MAX_HISTORY_REVIEWS + " 条", 13, 0xff93F2C1, Typeface.BOLD);
+        historyLimit.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        historyTitle.addView(historyLimit);
+        historyPanel.addView(historyTitle);
+        historyHint = text("完成过的本机复盘会显示在这里，点击即可继续查看。", 13, 0xffA9C7BB, Typeface.NORMAL);
+        historyHint.setLineSpacing(dp(2), 1.0f);
+        historyHint.setPadding(0, dp(8), 0, dp(10));
+        historyPanel.addView(historyHint);
+        historyList = new LinearLayout(this);
+        historyList.setOrientation(LinearLayout.VERTICAL);
+        historyPanel.addView(historyList);
+        content.addView(historyPanel, topMargin(dp(14)));
+        refreshHistoryPanel();
+
         return scroll;
     }
 
@@ -319,7 +349,7 @@ public class MainActivity extends Activity {
         scoreRow.addView(chainValue, scorePillParams(dp(8)));
         scoreRow.addView(recoveryValue, scorePillParams(dp(8)));
         statusBar.addView(scoreRow, topMargin(dp(12)));
-        actionLevelValue = text("动作等级参考：--", 15, 0xff93F2C1, Typeface.BOLD);
+        actionLevelValue = text("综合质量参考：--", 15, 0xff93F2C1, Typeface.BOLD);
         actionLevelValue.setPadding(0, dp(12), 0, 0);
         statusBar.addView(actionLevelValue);
 
@@ -341,6 +371,24 @@ public class MainActivity extends Activity {
 
         LinearLayout timeline = darkPanel();
         timeline.addView(text("时间线", 22, 0xffF2FFF7, Typeface.BOLD));
+        LinearLayout slowControls = row();
+        slowMotionToggleButton = darkButton("慢动作：开", false);
+        slowMotionToggleButton.setOnClickListener(v -> {
+            slowMotionEnabled = !slowMotionEnabled;
+            updateSlowMotionControls();
+            updateAutoPlaybackSpeed();
+        });
+        slowControls.addView(slowMotionToggleButton, new LinearLayout.LayoutParams(0, dp(46), 1));
+        slowMotionSpeedButton = darkButton("速度：0.5x", false);
+        slowMotionSpeedButton.setOnClickListener(v -> {
+            cycleSlowMotionSpeed();
+            updateSlowMotionControls();
+            updateAutoPlaybackSpeed();
+        });
+        LinearLayout.LayoutParams speedParams = new LinearLayout.LayoutParams(0, dp(46), 1);
+        speedParams.setMargins(dp(8), 0, 0, 0);
+        slowControls.addView(slowMotionSpeedButton, speedParams);
+        timeline.addView(slowControls, topMargin(dp(12)));
         HorizontalScrollView timelineScroll = new HorizontalScrollView(this);
         timelineScroll.setHorizontalScrollBarEnabled(false);
         timelineStrip = new LinearLayout(this);
@@ -376,8 +424,10 @@ public class MainActivity extends Activity {
             Button reset = darkButton("新建复盘", false);
             reset.setOnClickListener(v -> {
                 if (reviewVideo != null) {
+                    stopPlaybackAutomation();
                     reviewVideo.stopPlayback();
                 }
+                refreshHistoryPanel();
                 showScreen(uploadScreen);
             });
             topbar.addView(reset, new LinearLayout.LayoutParams(dp(116), dp(44)));
@@ -642,11 +692,24 @@ public class MainActivity extends Activity {
     }
 
     private void pickVideo() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("video/*");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-        startActivityForResult(intent, PICK_VIDEO);
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= 33) {
+            intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType("video/*");
+        } else {
+            intent = new Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI);
+            intent.setType("video/*");
+        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, PICK_VIDEO);
+        } catch (Exception pickerError) {
+            Intent fallback = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            fallback.addCategory(Intent.CATEGORY_OPENABLE);
+            fallback.setType("video/*");
+            fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            startActivityForResult(fallback, PICK_VIDEO);
+        }
     }
 
     @Override
@@ -754,6 +817,7 @@ public class MainActivity extends Activity {
                 String cacheKey = cacheKey(source.label(), durationMs, width, height, rotationDegrees);
                 CachedReview cached = loadCachedReview(cacheKey);
                 if (cached != null && !TextUtils.isEmpty(cached.videoPath) && new java.io.File(cached.videoPath).exists()) {
+                    rememberHistoryKey(cached.key);
                     runOnUiThread(() -> displayCachedReview(cached, "已加载本地复盘缓存。"));
                     return;
                 }
@@ -869,6 +933,7 @@ public class MainActivity extends Activity {
         if (exportButton != null) {
             exportButton.setEnabled(!TextUtils.isEmpty(review.videoPath) && !review.frames.isEmpty());
         }
+        updateSlowMotionControls();
         showScreen(dashboardScreen);
     }
 
@@ -899,14 +964,158 @@ public class MainActivity extends Activity {
                 ? 1
                 : (int) Math.max(1, summary.events.get(0).timeSec * 1000);
         reviewVideo.setOnPreparedListener(player -> {
+            reviewMediaPlayer = player;
             player.setVolume(0f, 0f);
+            appliedPlaybackSpeed = 1.0f;
+            setReviewPlaybackSpeed(1.0f);
             reviewVideo.seekTo(previewStartMs);
             if (poseOverlay != null) {
                 poseOverlay.refreshNow();
             }
+            startPlaybackSpeedMonitor();
             reviewVideo.start();
-            reviewVideo.postDelayed(() -> reviewVideo.pause(), 900);
+            initialPreviewPauseRunnable = () -> {
+                if (reviewVideo != null && reviewVideo.isPlaying()) {
+                    reviewVideo.pause();
+                }
+                if (poseOverlay != null) {
+                    poseOverlay.refreshNow();
+                }
+                initialPreviewPauseRunnable = null;
+            };
+            reviewVideo.postDelayed(initialPreviewPauseRunnable, 900);
         });
+        reviewVideo.setOnCompletionListener(player -> {
+            setReviewPlaybackSpeed(1.0f);
+            if (poseOverlay != null) {
+                poseOverlay.refreshNow();
+            }
+        });
+    }
+
+    private void playStrokeSlowMotion(StrokeScore stroke) {
+        if (stroke == null || reviewVideo == null) {
+            return;
+        }
+        cancelInitialPreviewPause();
+        int contactMs = (int) Math.max(0, stroke.timeSec * 1000);
+        int startMs = Math.max(0, contactMs - 450);
+        reviewVideo.seekTo(startMs);
+        startPlaybackSpeedMonitor();
+        updateAutoPlaybackSpeed();
+        if (poseOverlay != null) {
+            poseOverlay.refreshNow();
+            poseOverlay.postDelayed(poseOverlay::refreshNow, 120);
+        }
+        reviewVideo.start();
+    }
+
+    private void setReviewPlaybackSpeed(float speed) {
+        if (reviewVideo == null) {
+            return;
+        }
+        float normalized = Math.max(0.2f, Math.min(1.0f, speed));
+        if (Math.abs(appliedPlaybackSpeed - normalized) < 0.01f) {
+            return;
+        }
+        try {
+            android.media.MediaPlayer player = reviewMediaPlayer;
+            if (player != null) {
+                android.media.PlaybackParams params = player.getPlaybackParams();
+                params.setSpeed(normalized);
+                player.setPlaybackParams(params);
+                appliedPlaybackSpeed = normalized;
+            }
+        } catch (Throwable speedError) {
+            Log.w(TAG, "set playback speed failed", speedError);
+        }
+    }
+
+    private void startPlaybackSpeedMonitor() {
+        if (reviewVideo == null) {
+            return;
+        }
+        if (playbackSpeedMonitor == null) {
+            playbackSpeedMonitor = new Runnable() {
+                @Override
+                public void run() {
+                    updateAutoPlaybackSpeed();
+                    if (reviewVideo != null) {
+                        reviewVideo.postDelayed(this, 90L);
+                    }
+                }
+            };
+        }
+        reviewVideo.removeCallbacks(playbackSpeedMonitor);
+        reviewVideo.post(playbackSpeedMonitor);
+    }
+
+    private void stopPlaybackAutomation() {
+        cancelInitialPreviewPause();
+        if (reviewVideo != null && playbackSpeedMonitor != null) {
+            reviewVideo.removeCallbacks(playbackSpeedMonitor);
+        }
+        setReviewPlaybackSpeed(1.0f);
+    }
+
+    private void cancelInitialPreviewPause() {
+        if (reviewVideo != null && initialPreviewPauseRunnable != null) {
+            reviewVideo.removeCallbacks(initialPreviewPauseRunnable);
+        }
+        initialPreviewPauseRunnable = null;
+    }
+
+    private void updateAutoPlaybackSpeed() {
+        if (reviewVideo == null) {
+            return;
+        }
+        StrokeScore active = slowMotionEnabled && reviewVideo.isPlaying()
+                ? slowMotionStrokeAt(reviewVideo.getCurrentPosition())
+                : null;
+        setReviewPlaybackSpeed(active == null ? 1.0f : slowMotionSpeed);
+        if (active != null && (selectedStroke == null || selectedStroke.index != active.index)) {
+            showStrokeStatus(active);
+        }
+    }
+
+    private StrokeScore slowMotionStrokeAt(int currentMs) {
+        CachedReview review = currentReview;
+        if (review == null || review.summary == null || review.summary.events == null) {
+            return null;
+        }
+        for (StrokeScore stroke : review.summary.events) {
+            int contactMs = (int) Math.round(stroke.timeSec * 1000.0);
+            int startMs = Math.max(0, contactMs - 420);
+            int endMs = contactMs + 720;
+            if (currentMs >= startMs && currentMs <= endMs) {
+                return stroke;
+            }
+        }
+        return null;
+    }
+
+    private void cycleSlowMotionSpeed() {
+        if (slowMotionSpeed >= 0.74f) {
+            slowMotionSpeed = 0.5f;
+        } else if (slowMotionSpeed >= 0.49f) {
+            slowMotionSpeed = 0.33f;
+        } else {
+            slowMotionSpeed = 0.75f;
+        }
+    }
+
+    private void updateSlowMotionControls() {
+        if (slowMotionToggleButton != null) {
+            slowMotionToggleButton.setText(slowMotionEnabled ? "慢动作：开" : "慢动作：关");
+        }
+        if (slowMotionSpeedButton != null) {
+            slowMotionSpeedButton.setEnabled(slowMotionEnabled);
+            slowMotionSpeedButton.setText(String.format(Locale.US, "速度：%.2gx", slowMotionSpeed));
+        }
+    }
+
+    private static double clamp(double value, double low, double high) {
+        return Math.max(low, Math.min(high, value));
     }
 
     private String ensurePlayablePreviewPath(VideoSource source) {
@@ -948,19 +1157,7 @@ public class MainActivity extends Activity {
     }
 
     private void loadLastReviewIfAvailable() {
-        String key = getPreferences(MODE_PRIVATE).getString("last_review_key", null);
-        String schema = getPreferences(MODE_PRIVATE).getString("last_review_schema", null);
-        if (TextUtils.isEmpty(key)) {
-            return;
-        }
-        if (!CACHE_SCHEMA_VERSION.equals(schema)) {
-            return;
-        }
-        CachedReview cached = loadCachedReview(key);
-        if (cached == null || TextUtils.isEmpty(cached.videoPath) || !new java.io.File(cached.videoPath).exists()) {
-            return;
-        }
-        displayCachedReview(cached, "已加载上一次复盘结果。");
+        refreshHistoryPanel();
     }
 
     private String cacheKey(String label, int durationMs, int width, int height, int rotationDegrees) {
@@ -1037,6 +1234,7 @@ public class MainActivity extends Activity {
                     .putString("last_review_key", review.key)
                     .putString("last_review_schema", CACHE_SCHEMA_VERSION)
                     .apply();
+            rememberHistoryKey(review.key);
         } catch (Exception saveError) {
             Log.w(TAG, "review cache save failed", saveError);
         }
@@ -1059,6 +1257,144 @@ public class MainActivity extends Activity {
         }
     }
 
+    private List<String> loadHistoryKeys() {
+        String schema = getPreferences(MODE_PRIVATE).getString("history_schema", null);
+        if (!CACHE_SCHEMA_VERSION.equals(schema)) {
+            return new ArrayList<>();
+        }
+        String raw = getPreferences(MODE_PRIVATE).getString("review_history_keys", "");
+        ArrayList<String> keys = new ArrayList<>();
+        if (TextUtils.isEmpty(raw)) {
+            return keys;
+        }
+        String[] parts = raw.split(",");
+        for (String part : parts) {
+            if (!TextUtils.isEmpty(part) && !keys.contains(part)) {
+                keys.add(part);
+            }
+        }
+        return keys;
+    }
+
+    private void saveHistoryKeys(List<String> keys) {
+        getPreferences(MODE_PRIVATE).edit()
+                .putString("history_schema", CACHE_SCHEMA_VERSION)
+                .putString("review_history_keys", TextUtils.join(",", keys))
+                .apply();
+    }
+
+    private void rememberHistoryKey(String key) {
+        if (TextUtils.isEmpty(key)) {
+            return;
+        }
+        List<String> keys = loadHistoryKeys();
+        keys.remove(key);
+        keys.add(0, key);
+        while (keys.size() > MAX_HISTORY_REVIEWS) {
+            String removed = keys.remove(keys.size() - 1);
+            deleteReviewCache(removed);
+        }
+        saveHistoryKeys(keys);
+        runOnUiThread(this::refreshHistoryPanel);
+    }
+
+    private void refreshHistoryPanel() {
+        if (historyList == null || historyHint == null) {
+            return;
+        }
+        List<String> keys = loadHistoryKeys();
+        ArrayList<String> validKeys = new ArrayList<>();
+        ArrayList<CachedReview> reviews = new ArrayList<>();
+        for (String key : keys) {
+            CachedReview review = loadCachedReview(key);
+            if (review == null || TextUtils.isEmpty(review.videoPath) || !new java.io.File(review.videoPath).exists()) {
+                deleteReviewCache(key);
+                continue;
+            }
+            validKeys.add(key);
+            reviews.add(review);
+        }
+        if (validKeys.size() != keys.size()) {
+            saveHistoryKeys(validKeys);
+        }
+        historyList.removeAllViews();
+        historyHint.setText(reviews.isEmpty()
+                ? "暂无历史复盘。完成一次上传后会自动保留在本机。"
+                : "已保留 " + reviews.size() + "/" + MAX_HISTORY_REVIEWS + " 条本机复盘，点击任意记录继续查看。");
+        if (reviews.isEmpty()) {
+            TextView empty = text("暂无历史记录", 14, 0xffA9C7BB, Typeface.NORMAL);
+            empty.setGravity(Gravity.CENTER);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(0x22081410);
+            bg.setCornerRadius(dp(8));
+            bg.setStroke(dp(1), 0x22D7F8DF);
+            empty.setBackground(bg);
+            historyList.addView(empty, topFixedMargin(0, dp(64)));
+            return;
+        }
+        for (CachedReview review : reviews) {
+            Button item = historyButton(review);
+            item.setOnClickListener(v -> displayCachedReview(review, "已从历史记录加载。"));
+            historyList.addView(item, topFixedMargin(dp(8), dp(72)));
+        }
+    }
+
+    private Button historyButton(CachedReview review) {
+        String name = shortLabel(review.sourceLabel);
+        String detail = format(review.durationMs / 1000.0) + "s"
+                + " · " + review.summary.events.size() + " 个重发力窗口"
+                + " · " + cacheTimeText(review.key);
+        return timelineButton(name + "\n" + detail);
+    }
+
+    private String shortLabel(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return "未命名视频";
+        }
+        String text = value;
+        int slash = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
+        if (slash >= 0 && slash < text.length() - 1) {
+            text = text.substring(slash + 1);
+        }
+        if (text.length() > 32) {
+            text = text.substring(0, 12) + "..." + text.substring(text.length() - 14);
+        }
+        return text;
+    }
+
+    private String cacheTimeText(String key) {
+        java.io.File file = new java.io.File(reviewCacheDir(key), "review.bin");
+        long time = file.exists() ? file.lastModified() : 0L;
+        if (time <= 0L) {
+            return "已完成";
+        }
+        java.text.SimpleDateFormat formatter = new java.text.SimpleDateFormat("MM-dd HH:mm", Locale.CHINA);
+        return formatter.format(new java.util.Date(time));
+    }
+
+    private void deleteReviewCache(String key) {
+        if (TextUtils.isEmpty(key)) {
+            return;
+        }
+        deleteRecursively(reviewCacheDir(key));
+    }
+
+    private void deleteRecursively(java.io.File file) {
+        if (file == null || !file.exists()) {
+            return;
+        }
+        if (file.isDirectory()) {
+            java.io.File[] children = file.listFiles();
+            if (children != null) {
+                for (java.io.File child : children) {
+                    deleteRecursively(child);
+                }
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+    }
+
     private void renderTimeline(ReviewSummary summary) {
         timelineStrip.removeAllViews();
         if (summary.events.isEmpty()) {
@@ -1071,17 +1407,13 @@ public class MainActivity extends Activity {
             Button marker = timelineButton("#" + (stroke.index + 1) + "\n" + format(stroke.timeSec) + "s");
             marker.setOnClickListener(v -> {
                 showStrokeStatus(stroke);
-                reviewVideo.seekTo((int) Math.max(0, stroke.timeSec * 1000));
-                if (poseOverlay != null) {
-                    poseOverlay.refreshNow();
-                }
-                reviewVideo.start();
+                playStrokeSlowMotion(stroke);
             });
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(86), dp(62));
             params.setMargins(0, 0, dp(8), 0);
             timelineStrip.addView(marker, params);
         }
-        eventSummary.setText("点击时间轴可跳转到对应重发力窗口。");
+        eventSummary.setText("点击时间轴可跳转到对应重发力窗口；播放经过重发力窗口时会按当前设置自动慢放。");
     }
 
     private void exportCurrentReview() {
@@ -1413,7 +1745,7 @@ public class MainActivity extends Activity {
             timingValue.setText("击球时机\n--");
             chainValue.setText("发力链\n--");
             recoveryValue.setText("回位恢复\n--");
-            actionLevelValue.setText("动作等级参考：--");
+            actionLevelValue.setText("综合质量参考：--");
             evidenceDetail.setVisibility(View.GONE);
             return;
         }
@@ -1422,7 +1754,7 @@ public class MainActivity extends Activity {
         timingValue.setText("击球时机\n" + format(stroke.timing));
         chainValue.setText("发力链\n" + format(stroke.chain));
         recoveryValue.setText("回位恢复\n" + format(stroke.recovery));
-        actionLevelValue.setText("动作等级参考：" + stroke.actionLevel + " · 综合 " + format(stroke.overall));
+        actionLevelValue.setText("综合质量参考：" + stroke.actionLevel + " · 综合 " + format(stroke.overall));
         evidenceDetail.setVisibility(View.GONE);
     }
 
@@ -1562,7 +1894,7 @@ public class MainActivity extends Activity {
             out.append(formatEvidenceItem(report.items.get(i)));
         }
         out.append("\n\n训练建议: ").append(report.suggestion);
-        out.append("\n提示: 等级来自端上姿态规则，会受视角、遮挡和球员远近影响，适合做动作复盘参考。");
+        out.append("\n提示: 结果来自端上姿态规则，会受视角、遮挡和球员远近影响，适合做动作复盘参考。");
         return out.toString();
     }
 
@@ -1573,7 +1905,7 @@ public class MainActivity extends Activity {
     }
 
     private String gradeLabel(double score) {
-        return gradeCode(score) + " 级";
+        return gradeCode(score) + " 档";
     }
 
     private String gradeCode(double score) {
@@ -2263,22 +2595,40 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static final class Point3 implements Serializable {
+        private static final long serialVersionUID = 1L;
+        final double x;
+        final double y;
+        final double z;
+        final double visibility;
+
+        Point3(double x, double y, double z, double visibility) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.visibility = visibility;
+        }
+    }
+
     private static final class FramePose implements Serializable {
         private static final long serialVersionUID = 1L;
         final double timeSec;
         final int width;
         final int height;
         final Point2[] pose;
+        final Point3[] worldPose;
 
-        FramePose(double timeSec, int width, int height, Point2[] pose) {
+        FramePose(double timeSec, int width, int height, Point2[] pose, Point3[] worldPose) {
             this.timeSec = timeSec;
             this.width = width;
             this.height = height;
             this.pose = pose;
+            this.worldPose = worldPose;
         }
 
         static FramePose fromResult(double timeSec, int width, int height, PoseLandmarkerResult result) {
             Point2[] pose = new Point2[33];
+            Point3[] worldPose = new Point3[33];
             if (result != null && !result.landmarks().isEmpty()) {
                 List<NormalizedLandmark> landmarks = result.landmarks().get(0);
                 int count = Math.min(33, landmarks.size());
@@ -2288,11 +2638,32 @@ public class MainActivity extends Activity {
                     pose[i] = new Point2(lm.x() * width, lm.y() * height, visibility);
                 }
             }
-            return new FramePose(timeSec, width, height, pose);
+            if (result != null && !result.worldLandmarks().isEmpty()) {
+                List<Landmark> landmarks = result.worldLandmarks().get(0);
+                int count = Math.min(33, landmarks.size());
+                for (int i = 0; i < count; i++) {
+                    Landmark lm = landmarks.get(i);
+                    double visibility = lm.visibility().orElse(1.0f);
+                    worldPose[i] = new Point3(lm.x(), lm.y(), lm.z(), visibility);
+                }
+            }
+            return new FramePose(timeSec, width, height, pose, worldPose);
         }
 
         boolean hasPose() {
             for (Point2 point : pose) {
+                if (point != null) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        boolean hasWorldPose() {
+            if (worldPose == null) {
+                return false;
+            }
+            for (Point3 point : worldPose) {
                 if (point != null) {
                     return true;
                 }
@@ -2412,19 +2783,57 @@ public class MainActivity extends Activity {
                 return null;
             }
             double sec = video == null ? frames.get(0).timeSec : video.getCurrentPosition() / 1000.0;
-            FramePose best = frames.get(0);
-            double bestGap = Math.abs(best.timeSec - sec);
-            for (int i = 1; i < frames.size(); i++) {
-                FramePose candidate = frames.get(i);
-                double gap = Math.abs(candidate.timeSec - sec);
-                if (gap < bestGap) {
-                    best = candidate;
-                    bestGap = gap;
-                } else if (candidate.timeSec > sec && gap > bestGap) {
-                    break;
-                }
+            if (sec <= frames.get(0).timeSec) {
+                return frames.get(0);
             }
-            return best;
+            FramePose last = frames.get(frames.size() - 1);
+            if (sec >= last.timeSec) {
+                return last;
+            }
+            FramePose prev = frames.get(0);
+            for (int i = 1; i < frames.size(); i++) {
+                FramePose next = frames.get(i);
+                if (next.timeSec >= sec) {
+                    return interpolate(prev, next, sec);
+                }
+                prev = next;
+            }
+            return last;
+        }
+
+        private static FramePose interpolate(FramePose a, FramePose b, double sec) {
+            double span = Math.max(0.001, b.timeSec - a.timeSec);
+            if (span > 0.25) {
+                return Math.abs(sec - a.timeSec) <= Math.abs(b.timeSec - sec) ? a : b;
+            }
+            double t = Math.max(0.0, Math.min(1.0, (sec - a.timeSec) / span));
+            Point2[] pose = new Point2[33];
+            for (int i = 0; i < pose.length; i++) {
+                Point2 pa = i < a.pose.length ? a.pose[i] : null;
+                Point2 pb = i < b.pose.length ? b.pose[i] : null;
+                pose[i] = interpolatePoint(pa, pb, t);
+            }
+            int width = a.width > 0 ? a.width : b.width;
+            int height = a.height > 0 ? a.height : b.height;
+            return new FramePose(sec, width, height, pose, null);
+        }
+
+        private static Point2 interpolatePoint(Point2 a, Point2 b, double t) {
+            if (a == null && b == null) {
+                return null;
+            }
+            if (a == null) {
+                return new Point2(b.x, b.y, b.visibility * 0.65);
+            }
+            if (b == null) {
+                return new Point2(a.x, a.y, a.visibility * 0.65);
+            }
+            double visibility = a.visibility * (1.0 - t) + b.visibility * t;
+            return new Point2(
+                    a.x * (1.0 - t) + b.x * t,
+                    a.y * (1.0 - t) + b.y * t,
+                    visibility
+            );
         }
 
         private void computeFit(FramePose frame) {
@@ -2717,13 +3126,13 @@ public class MainActivity extends Activity {
         }
 
         private static String actionLevel(double score) {
-            if (score < 40) return "中羽1级以下动作参考";
-            if (score < 50) return "中羽1级动作参考";
-            if (score < 60) return "中羽2级动作参考";
-            if (score < 70) return "中羽3级动作参考";
-            if (score < 80) return "中羽4级动作参考";
-            if (score < 88) return "中羽5级动作参考";
-            return "中羽6级+动作参考";
+            if (score < 40) return "待观察";
+            if (score < 50) return "基础";
+            if (score < 60) return "可训练";
+            if (score < 70) return "较稳定";
+            if (score < 80) return "良好";
+            if (score < 88) return "优秀";
+            return "高质量";
         }
 
         private static List<Integer> robustEvents(double[] values, double fps, int limit) {
