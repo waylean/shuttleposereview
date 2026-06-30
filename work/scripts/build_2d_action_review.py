@@ -78,6 +78,60 @@ def angle_delta(a, b):
     return float(abs(d))
 
 
+def summarize_upper_arm_dominance(window):
+    upper_energy = percentile_value([r.get("upper_arm_angular_speed_deg_s") for r in window], 82, 0.0)
+    forearm_energy = percentile_value([r.get("forearm_angular_speed_deg_s") for r in window], 82, 0.0)
+    wrist_energy = percentile_value([r.get("normalized_wrist_speed_body_s") for r in window], 88, 0.0)
+    elbow_speeds = [
+        float(r.get("elbow_angular_speed_deg_s") or 0.0)
+        for r in window
+        if r.get("elbow_angular_speed_deg_s") is not None
+    ]
+    active_elbow_speeds = [v for v in elbow_speeds if v >= 90.0]
+    elbow_active_ratio = len(active_elbow_speeds) / max(1, len(elbow_speeds))
+    elbow_min_active_speed = min(active_elbow_speeds) if active_elbow_speeds else 0.0
+    low_elbow_ratio = sum(1 for v in elbow_speeds if v < 90.0) / max(1, len(elbow_speeds))
+    elbow_no_pause_score = clamp((elbow_active_ratio * 72.0) + score_range(elbow_min_active_speed, 90.0, 260.0) * 0.28)
+    elbow_pause_detected = low_elbow_ratio >= 0.25
+    wrist_proxy_energy = wrist_energy * 85.0
+    distal_energy = forearm_energy * 0.56 + wrist_proxy_energy
+    total = upper_energy + distal_energy
+    base_ratio = clamp((upper_energy / total) * 100.0 if total > 1e-6 else 0.0)
+    no_pause_bonus = score_range(elbow_no_pause_score, 35.0, 92.0) * 0.16
+    pause_penalty = low_elbow_ratio * 12.0
+    ratio = clamp(base_ratio + no_pause_bonus - pause_penalty)
+    arm_conf = median_value([r.get("active_arm_confidence") for r in window], 0.0)
+    low_conf_ratio = sum(1 for r in window if float(r.get("active_arm_confidence") or 0.0) < 0.45) / max(1, len(window))
+    if ratio >= 60.0:
+        label = "high"
+    elif ratio >= 35.0:
+        label = "medium"
+    else:
+        label = "low"
+    if arm_conf >= 0.65 and low_conf_ratio <= 0.35:
+        reliability = "high"
+    elif arm_conf >= 0.45 and low_conf_ratio <= 0.55:
+        reliability = "medium"
+    else:
+        reliability = "low"
+    return {
+        "ratio": round(ratio, 1),
+        "label": label,
+        "reliability": reliability,
+        "base_ratio": round(float(base_ratio), 1),
+        "elbow_no_pause_score": round(float(elbow_no_pause_score), 1),
+        "elbow_pause_detected": bool(elbow_pause_detected),
+        "elbow_active_ratio": round(float(elbow_active_ratio), 3),
+        "elbow_low_speed_ratio": round(float(low_elbow_ratio), 3),
+        "elbow_min_active_speed": round(float(elbow_min_active_speed), 1),
+        "upper_arm_energy": round(float(upper_energy), 1),
+        "forearm_energy": round(float(forearm_energy), 1),
+        "wrist_proxy_energy": round(float(wrist_proxy_energy), 1),
+        "arm_conf_median": round(float(arm_conf), 3),
+        "low_confidence_ratio": round(float(low_conf_ratio), 3),
+    }
+
+
 def smooth_series(values, alpha=0.45):
     out = []
     prev = None
@@ -263,6 +317,8 @@ def frame_metrics(frame, fps, idx, left_speed, right_speed, events):
     opp_hp = point(frame, 24 if side == "left" else 23)
     arm_conf = min(visibility(frame, shoulder), visibility(frame, elbow), visibility(frame, wrist))
     wrist_above = float(sh[1] - wr[1]) if sh is not None and wr is not None else None
+    upper_arm_angle = line_angle(sh, el)
+    forearm_angle = line_angle(el, wr)
     shoulder_angle = line_angle(point(frame, 11), point(frame, 12))
     hip_angle = line_angle(point(frame, 23), point(frame, 24))
     twist = angle_delta(shoulder_angle, hip_angle)
@@ -283,6 +339,8 @@ def frame_metrics(frame, fps, idx, left_speed, right_speed, events):
         "left_wrist_speed_px_s": round(float(left_speed[idx]), 2),
         "right_wrist_speed_px_s": round(float(right_speed[idx]), 2),
         "elbow_angle_deg": round(angle_deg(sh, el, wr), 1) if angle_deg(sh, el, wr) is not None else None,
+        "upper_arm_angle_deg": round(upper_arm_angle, 1) if upper_arm_angle is not None else None,
+        "forearm_angle_deg": round(forearm_angle, 1) if forearm_angle is not None else None,
         "knee_angle_deg": round(angle_deg(hp, kn, an), 1) if angle_deg(hp, kn, an) is not None else None,
         "wrist_above_shoulder_px": round(wrist_above, 1) if wrist_above is not None else None,
         "shoulder_hip_separation_deg": round(twist, 1) if twist is not None else None,
@@ -478,6 +536,7 @@ def stroke_quality_scores(records, event_idx, start, end, fps):
     wrist_late_score = 50.0
     if wrist_peak_frame is not None:
         wrist_late_score = score_range(abs(wrist_peak_frame - event_idx) / max(fps, 1.0), 0.38, 0.02)
+    upper_arm_dominance = summarize_upper_arm_dominance(stroke_window)
     knee_bends = [max(0.0, 180.0 - float(r["knee_angle_deg"])) for r in pre if r.get("knee_angle_deg") is not None]
     knee_load_score = score_range(max(knee_bends) if knee_bends else 0.0, 12.0, 72.0)
     chain_score = clamp(
@@ -601,6 +660,23 @@ def stroke_quality_scores(records, event_idx, start, end, fps):
             "final_raw": r4(chain_score),
             "final_rounded": round(chain_score),
         },
+        "upper_arm_dominance": {
+            "ratio": r4(upper_arm_dominance["ratio"]),
+            "label": upper_arm_dominance["label"],
+            "reliability": upper_arm_dominance["reliability"],
+            "base_ratio": r4(upper_arm_dominance["base_ratio"]),
+            "elbow_no_pause_score": r4(upper_arm_dominance["elbow_no_pause_score"]),
+            "elbow_pause_detected": upper_arm_dominance["elbow_pause_detected"],
+            "elbow_active_ratio": r4(upper_arm_dominance["elbow_active_ratio"]),
+            "elbow_low_speed_ratio": r4(upper_arm_dominance["elbow_low_speed_ratio"]),
+            "elbow_min_active_speed": r4(upper_arm_dominance["elbow_min_active_speed"]),
+            "upper_arm_energy": r4(upper_arm_dominance["upper_arm_energy"]),
+            "forearm_energy": r4(upper_arm_dominance["forearm_energy"]),
+            "wrist_proxy_energy": r4(upper_arm_dominance["wrist_proxy_energy"]),
+            "arm_conf_median": r4(upper_arm_dominance["arm_conf_median"]),
+            "low_confidence_ratio": r4(upper_arm_dominance["low_confidence_ratio"]),
+            "formula": "base upper-arm ratio adjusted by elbow no-pause bonus and elbow low-speed pause penalty",
+        },
         "recovery": {
             "recover_window": [recover_start, recover_end],
             "stable_frame": stable_frame,
@@ -621,6 +697,9 @@ def stroke_quality_scores(records, event_idx, start, end, fps):
         "chain_score": round(chain_score),
         "recovery_score": round(recovery_score),
         "score_breakdown": score_breakdown,
+        "upper_arm_dominance_ratio": upper_arm_dominance["ratio"],
+        "upper_arm_dominance_label": upper_arm_dominance["label"],
+        "upper_arm_dominance_reliability": upper_arm_dominance["reliability"],
         "contact_height_body": round(contact_height_ratio, 2),
         "max_contact_height_body": round(max_height_ratio, 2),
         "recovery_time_sec": round(recovery_seconds, 2),
@@ -651,13 +730,21 @@ def stroke_quality_scores(records, event_idx, start, end, fps):
 def enrich_realtime_metrics(records, events, fps):
     prev_elbow = None
     prev_knee = None
+    prev_upper_arm = None
+    prev_forearm = None
     for rec in records:
         elbow = rec.get("elbow_angle_deg")
         knee = rec.get("knee_angle_deg")
+        upper_arm = rec.get("upper_arm_angle_deg")
+        forearm = rec.get("forearm_angle_deg")
         elbow_speed = abs(elbow - prev_elbow) * fps if elbow is not None and prev_elbow is not None else 0.0
         knee_speed = abs(knee - prev_knee) * fps if knee is not None and prev_knee is not None else 0.0
+        upper_arm_speed = angle_delta(float(upper_arm), float(prev_upper_arm)) * fps if upper_arm is not None and prev_upper_arm is not None else 0.0
+        forearm_speed = angle_delta(float(forearm), float(prev_forearm)) * fps if forearm is not None and prev_forearm is not None else 0.0
         prev_elbow = elbow if elbow is not None else prev_elbow
         prev_knee = knee if knee is not None else prev_knee
+        prev_upper_arm = upper_arm if upper_arm is not None else prev_upper_arm
+        prev_forearm = forearm if forearm is not None else prev_forearm
 
         torso = max(float(rec.get("torso_length_px") or 70.0), 55.0)
         normalized_wrist = float(rec.get("wrist_speed_px_s") or 0.0) / torso
@@ -670,6 +757,8 @@ def enrich_realtime_metrics(records, events, fps):
             "recover": 0.50,
         }.get(rec.get("phase"), 0.7)
         rec["elbow_angular_speed_deg_s"] = round(float(elbow_speed), 1)
+        rec["upper_arm_angular_speed_deg_s"] = round(float(upper_arm_speed), 1)
+        rec["forearm_angular_speed_deg_s"] = round(float(forearm_speed), 1)
         rec["knee_angular_speed_deg_s"] = round(float(knee_speed), 1)
         rec["normalized_wrist_speed_body_s"] = round(float(normalized_wrist), 2)
 
@@ -699,6 +788,9 @@ def enrich_realtime_metrics(records, events, fps):
             "timing_score": quality["timing_score"],
             "chain_score": quality["chain_score"],
             "recovery_score": quality["recovery_score"],
+            "upper_arm_dominance_ratio": quality["upper_arm_dominance_ratio"],
+            "upper_arm_dominance_label": quality["upper_arm_dominance_label"],
+            "upper_arm_dominance_reliability": quality["upper_arm_dominance_reliability"],
             "score_breakdown": quality["score_breakdown"],
             "score_reliability": quality["score_reliability"],
             "reliability_notes": quality["reliability_notes"],
@@ -721,6 +813,9 @@ def enrich_realtime_metrics(records, events, fps):
                 "timing_score": 0,
                 "chain_score": 0,
                 "recovery_score": 0,
+                "upper_arm_dominance_ratio": 0.0,
+                "upper_arm_dominance_label": "low",
+                "upper_arm_dominance_reliability": "low",
                 "score_reliability": {"timing": "低", "chain": "低", "recovery": "低"},
                 "motion_intensity_index": 0.0,
                 "wrist_whip_speed_body_s": 0.0,
@@ -1061,6 +1156,7 @@ def write_html(payload, report_path, video_name, overlay_name):
     .live.timing { --scoreColor:var(--speed); }
     .live.chain { --scoreColor:var(--blue); }
     .live.recovery { --scoreColor:#b9f4ce; }
+    .live.upperArm { --scoreColor:#f6d56a; }
     .note { color:var(--muted); font-size:12px; line-height:1.45; margin:0; }
     .timelinePanel { grid-column:1 / -1; padding:10px; }
     #timeline { width:100%; height:86px; min-height:64px; border:1px solid var(--line); border-radius:6px; background:#07110f; display:block; touch-action:none; cursor:pointer; }
@@ -1079,7 +1175,7 @@ def write_html(payload, report_path, video_name, overlay_name):
       .app { padding:10px; }
       .topbar { align-items:flex-start; }
       main { grid-template-columns:1fr; }
-      .liveGrid { grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+      .liveGrid { grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
       .stageCard { padding:10px; }
       .stageCard strong { font-size:28px; }
       .live { min-height:116px; padding:14px; }
@@ -1141,6 +1237,7 @@ def write_html(payload, report_path, video_name, overlay_name):
         <div class="live timing"><span>击球时机</span><div class="scoreRow"><strong><span id="timingScoreNow" class="scoreValue">-</span><span class="unit">/100</span></strong></div><div class="scoreBar"><i id="timingBar"></i></div></div>
         <div class="live chain"><span>发力链</span><div class="scoreRow"><strong><span id="chainScoreNow" class="scoreValue">-</span><span class="unit">/100</span></strong></div><div class="scoreBar"><i id="chainBar"></i></div></div>
         <div class="live recovery"><span>回位恢复</span><div class="scoreRow"><strong><span id="recoveryScoreNow" class="scoreValue">-</span><span class="unit">/100</span></strong></div><div class="scoreBar"><i id="recoveryBar"></i></div></div>
+        <div class="live upperArm"><span>挥大臂占比</span><div class="scoreRow"><strong><span id="upperArmScoreNow" class="scoreValue">-</span><span class="unit">%</span></strong></div><div class="scoreBar"><i id="upperArmBar"></i></div></div>
       </div>
       <p class="note">三项分数来自明显重发力窗口，并保持到下一次重发力。放网、轻挡、过渡球可能不会单独计数；这里不是全部击球次数。</p>
     </aside>
@@ -1163,6 +1260,7 @@ def write_html(payload, report_path, video_name, overlay_name):
           <div class="metric"><span>Pose 覆盖率</span><strong id="poseCoverage"></strong></div>
           <div class="metric"><span>分析模式</span><strong>Pose only</strong></div>
           <div class="metric"><span>指标口径</span><strong>重发力窗口 0-100</strong></div>
+          <div class="metric"><span>平均挥大臂占比</span><strong id="upperArmAverage"></strong></div>
         </div>
         <table>
           <thead><tr><th>核心分数</th><th>当前口径</th></tr></thead>
@@ -1170,6 +1268,7 @@ def write_html(payload, report_path, video_name, overlay_name):
             <tr><td>击球时机</td><td>依赖重发力窗口、手腕相对肩部高度、发力点肘角和准备期侧身代理；适合判断低点、靠后、准备晚。</td></tr>
             <tr><td>发力链</td><td>依赖击球前后膝部加载、躯干打开、肘部加速、手腕鞭打的时间窗口能量；比单纯峰值顺序更稳。</td></tr>
             <tr><td>回位恢复</td><td>依赖重发力后手腕速度、肘膝角速度和躯干回正；适合看打完能否接下一拍，不适合判断真实步法距离。</td></tr>
+            <tr><td>挥大臂占比</td><td>估算上臂段角速度相对前臂段角速度和手腕末端速度代理的比例；如果肘关节没有明显停顿、顺着发力继续抡下去，会提高疑似大臂主导占比。</td></tr>
           </tbody>
         </table>
       </details>
@@ -1186,6 +1285,7 @@ const uploadInput = document.getElementById('uploadVideo'), uploadName = documen
 const phaseColors = {ready:'#667085', backswing:'#f6b84d', drive:'#59d7ff', contact:'#ff6961', follow:'#c084fc', recover:'#42d392'};
 const phaseLabels = {ready:'准备', backswing:'引拍', drive:'蹬转加速', contact:'发力点', follow:'随挥', recover:'回位'};
 document.getElementById('poseCoverage').textContent = (data.summary.pose_coverage*100).toFixed(1)+'%';
+document.getElementById('upperArmAverage').textContent = Number(data.summary.upper_arm_dominance_average || 0).toFixed(1)+'%';
 let selectedFrame = 0;
 let seekToken = 0;
 function cancelPendingSeek(){ seekToken += 1; }
@@ -1215,7 +1315,7 @@ function drawTimeline(active=0){
 }
 function fmtScore(v){ return v===null || v===undefined || !Number.isFinite(Number(v)) ? '-' : Math.round(Number(v)); }
 function setScore(id, barId, value){ const n=Number(value); const ok=Number.isFinite(n); document.getElementById(id).textContent = ok ? Math.round(n) : '-'; document.getElementById(barId).style.width = ok ? Math.max(0, Math.min(100, n))+'%' : '0%'; }
-function drawInfo(frame){ const r=data.records[frame], s=r.stroke_metrics || {}; const phase=phaseLabels[r.phase] || r.phase; const stroke=(r.stroke_index ?? 0)+1; document.getElementById('phaseNow').textContent = phase; document.getElementById('strokeNow').textContent = '第 '+stroke+' 次重发力'; document.getElementById('timeNow').textContent = Number(r.time_sec || 0).toFixed(2)+'s'; setScore('timingScoreNow','timingBar',s.timing_score); setScore('chainScoreNow','chainBar',s.chain_score); setScore('recoveryScoreNow','recoveryBar',s.recovery_score); }
+function drawInfo(frame){ const r=data.records[frame], s=r.stroke_metrics || {}; const phase=phaseLabels[r.phase] || r.phase; const stroke=(r.stroke_index ?? 0)+1; document.getElementById('phaseNow').textContent = phase; document.getElementById('strokeNow').textContent = '第 '+stroke+' 次重发力'; document.getElementById('timeNow').textContent = Number(r.time_sec || 0).toFixed(2)+'s'; setScore('timingScoreNow','timingBar',s.timing_score); setScore('chainScoreNow','chainBar',s.chain_score); setScore('recoveryScoreNow','recoveryBar',s.recovery_score); setScore('upperArmScoreNow','upperArmBar',s.upper_arm_dominance_ratio); }
 function resizePoseCanvas(){ if(!src.videoWidth || !src.videoHeight) return; poseCanvas.width = src.videoWidth; poseCanvas.height = src.videoHeight; }
 function drawPoseOverlay(frame){ resizePoseCanvas(); pctx.clearRect(0,0,poseCanvas.width,poseCanvas.height); const r=data.records[frame], pose=r.pose2d || []; const color=phaseColors[r.phase] || '#94a3b8'; pctx.lineCap='round'; pctx.lineJoin='round'; for(const [a,b] of data.pose_connections){ const A=pose[a], B=pose[b]; if(!A||!B||Math.min(A[2],B[2])<0.18) continue; pctx.strokeStyle=color; pctx.lineWidth=6; pctx.beginPath(); pctx.moveTo(A[0],A[1]); pctx.lineTo(B[0],B[1]); pctx.stroke(); } pose.forEach((p,i)=>{ if(!p||p[2]<0.18) return; const key=[13,14,15,16,25,26].includes(i); pctx.fillStyle=key?'#f6d56a':'#f2fff7'; const rad=key?7:5; pctx.beginPath(); pctx.arc(p[0],p[1],rad,0,Math.PI*2); pctx.fill(); }); }
 function drawAll(frame){ drawTimeline(frame); drawInfo(frame); drawPoseOverlay(frame); }
@@ -1331,6 +1431,12 @@ def main():
         shutil.copy2(video_src, video_dst)
     web_video = prepare_web_video(video_src, out_dir, args.label, fps)
     overlay = build_video(video_src, raw, records, events, out_dir, args.label, fps)
+    upper_arm_ratios = [
+        float(item.get("upper_arm_dominance_ratio"))
+        for item in stroke_metrics
+        if item.get("upper_arm_dominance_ratio") is not None
+    ]
+    upper_arm_average = round(float(np.mean(upper_arm_ratios)), 1) if upper_arm_ratios else 0.0
 
     summary = {
         "label": args.label,
@@ -1342,6 +1448,8 @@ def main():
         "event_semantics": "明显重发力窗口，不代表全部击球次数；放网、轻挡、过渡球可能不会单独计数。",
         "power_action_frames": events,
         "power_action_count": len(events),
+        "upper_arm_dominance_average": upper_arm_average,
+        "upper_arm_dominance_metric": "挥大臂占比：上臂段角速度相对前臂段角速度和手腕末端速度代理的比例，并结合肘关节是否缺少停顿；0-100，越高越疑似大臂主导。",
         "outputs": {
             "report_html": str(out_dir / f"{args.label}_2d_action_review.html"),
             "review_video": str(web_video),
