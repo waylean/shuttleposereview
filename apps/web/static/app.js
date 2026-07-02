@@ -20,6 +20,7 @@ const liveLog = document.getElementById("liveLog");
 const errorText = document.getElementById("errorText");
 const reportFrame = document.getElementById("reportFrame");
 const overlayVideo = document.getElementById("overlayVideo");
+const overlayPreviewCard = overlayVideo.closest(".side-card");
 const newReviewButton = document.getElementById("newReviewButton");
 const retryButton = document.getElementById("retryButton");
 const recentPanel = document.getElementById("recentPanel");
@@ -27,14 +28,31 @@ const recentJobs = document.getElementById("recentJobs");
 const refreshJobsButton = document.getElementById("refreshJobsButton");
 const historyMeta = document.getElementById("historyMeta");
 const workspaceTitle = document.getElementById("workspaceTitle");
+const modeHint = document.getElementById("modeHint");
+const reviewModeInputs = Array.from(document.querySelectorAll('input[name="reviewMode"]'));
 
-const MAX_UPLOAD_BYTES = 900 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 6 * 1024 * 1024 * 1024;
 const ACCEPTED_EXTENSIONS = [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"];
 const MAX_HISTORY_ITEMS = 20;
 
 let selectedFile = null;
 let pollTimer = null;
 let currentResult = null;
+
+function selectedMode() {
+  return reviewModeInputs.find((input) => input.checked)?.value || "short";
+}
+
+function modeLabel(mode) {
+  return mode === "long" ? "长视频骨架" : "短视频复盘";
+}
+
+function updateModeHint() {
+  const mode = selectedMode();
+  modeHint.textContent = mode === "long"
+    ? "长视频模式只生成全程骨架标注视频，不做重发力评分和证据分析。"
+    : "短视频复盘限制 60 秒以内，会生成评分、时间轴、重发力慢放和片段截取。";
+}
 
 function setFile(file) {
   selectedFile = file || null;
@@ -55,6 +73,7 @@ function resetFlow() {
   videoInput.value = "";
   setFile(null);
   currentResult = null;
+  resultPanel.classList.remove("long-mode");
   overlayVideo.removeAttribute("src");
   reportFrame.removeAttribute("src");
   showOnly(uploadPanel);
@@ -66,7 +85,7 @@ function validateFile(file) {
   const name = file.name.toLowerCase();
   const accepted = ACCEPTED_EXTENSIONS.some((suffix) => name.endsWith(suffix));
   if (!accepted) return "当前只支持 MP4、MOV、M4V、AVI、MKV、WEBM。";
-  if (file.size > MAX_UPLOAD_BYTES) return "视频超过 900MB，请先裁剪成短片段。";
+  if (file.size > MAX_UPLOAD_BYTES) return "视频超过 6GB，请先压缩或裁剪视频。";
   return "";
 }
 
@@ -105,20 +124,25 @@ startButton.addEventListener("click", () => {
 newReviewButton.addEventListener("click", resetFlow);
 retryButton.addEventListener("click", resetFlow);
 refreshJobsButton.addEventListener("click", loadRecentJobs);
+for (const input of reviewModeInputs) {
+  input.addEventListener("change", updateModeHint);
+}
 
 function uploadVideo(file) {
+  const mode = selectedMode();
   clearInterval(pollTimer);
   showOnly(jobPanel);
-  updateProgress({ status: "uploading", stage: "上传视频", progress: 1 });
+  updateProgress({ status: "uploading", stage: "上传视频", progress: 1, mode });
 
   const form = new FormData();
   form.append("video", file);
+  form.append("mode", mode);
   const request = new XMLHttpRequest();
   request.open("POST", "/api/jobs");
   request.upload.addEventListener("progress", (event) => {
     if (!event.lengthComputable) return;
     const uploadProgress = Math.min(10, Math.max(1, (event.loaded / event.total) * 10));
-    updateProgress({ status: "uploading", stage: "上传视频", progress: uploadProgress });
+    updateProgress({ status: "uploading", stage: "上传视频", progress: uploadProgress, mode });
   });
   request.addEventListener("load", () => {
     if (request.status < 200 || request.status >= 300) {
@@ -193,6 +217,8 @@ function setHref(element, url) {
 function showResult(job) {
   showOnly(resultPanel);
   currentResult = job.result || {};
+  const mode = job.mode || "short";
+  const longMode = mode === "long";
   setHref(openReport, currentResult.report_url);
   setHref(openOverlay, currentResult.overlay_url);
   setHref(openPoseOverlay, currentResult.pose_overlay_url);
@@ -202,8 +228,15 @@ function showResult(job) {
     overlayVideo.src = currentResult.overlay_url;
   }
   reportFrame.src = currentResult.report_url || "about:blank";
-  workspaceTitle.textContent = "动作复盘";
-  openReport.textContent = "完整页面";
+  workspaceTitle.textContent = longMode ? "长视频骨架渲染" : "动作复盘";
+  openReport.textContent = longMode ? "骨架页面" : "完整页面";
+  openOverlay.textContent = longMode ? "下载骨架标注视频" : "下载标注视频";
+  resultPanel.classList.toggle("long-mode", longMode);
+  const resultSide = resultPanel.querySelector(".result-side");
+  if (resultSide) resultSide.hidden = longMode;
+  if (overlayPreviewCard) overlayPreviewCard.hidden = longMode;
+  openJson.hidden = longMode;
+  openPoseOverlay.hidden = longMode;
   loadRecentJobs();
 }
 
@@ -255,7 +288,7 @@ function renderRecentJobs(jobs) {
     item.className = "recent-item";
     item.innerHTML = `
       <span>${escapeHtml(job.filename || "未命名视频")}</span>
-      <small>${formatTime(job.completed_at || job.updated_at)} · ${formatDuration(job)}</small>
+      <small>${modeLabel(job.mode)} · ${formatTime(job.completed_at || job.updated_at)} · ${formatDuration(job)}</small>
     `;
     item.addEventListener("click", () => showResult(job));
     recentJobs.appendChild(item);
@@ -285,3 +318,4 @@ function formatTime(value) {
 }
 
 loadRecentJobs();
+updateModeHint();

@@ -66,11 +66,15 @@ public class MainActivity extends Activity {
     private static final String ACTION_RUN_FILE = "com.waylean.shuttleposereview.ondevice.RUN_FILE";
     private static final String EXTRA_VIDEO_PATH = "video_path";
     private static final int PICK_VIDEO = 1001;
-    private static final int TARGET_FPS = 15;
+    private static final int SHORT_TARGET_FPS = 15;
+    private static final int LONG_TARGET_FPS = 10;
+    private static final int TARGET_FPS = SHORT_TARGET_FPS;
     private static final int MAX_DURATION_MS = 60_000;
+    private static final int LONG_MAX_DURATION_MS = 30 * 60_000;
     private static final int MAX_HISTORY_REVIEWS = 20;
     private static final int MODEL_INPUT_MAX_WIDTH = 640;
-    private static final String CACHE_SCHEMA_VERSION = "pose-fit-v4-60s-3d-world";
+    private static final int LONG_MODEL_INPUT_MAX_WIDTH = 512;
+    private static final String CACHE_SCHEMA_VERSION = "pose-fit-v5-mode-60s-longpose";
     private static final int COLOR_BG = 0xffF7F8F5;
     private static final int COLOR_SURFACE = 0xffffffff;
     private static final int COLOR_TEXT = 0xff161A17;
@@ -85,6 +89,8 @@ public class MainActivity extends Activity {
     private Button pickButton;
     private Button demoButton;
     private Button exportButton;
+    private Button shortModeButton;
+    private Button longModeButton;
     private Button slowMotionToggleButton;
     private Button slowMotionSpeedButton;
     private LinearLayout progressCard;
@@ -121,6 +127,7 @@ public class MainActivity extends Activity {
     private boolean slowMotionEnabled = true;
     private float slowMotionSpeed = 0.5f;
     private float appliedPlaybackSpeed = 1.0f;
+    private boolean longVideoMode = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -249,10 +256,27 @@ public class MainActivity extends Activity {
         selectedFileLabel.setGravity(Gravity.CENTER);
         selectedFileLabel.setPadding(0, dp(6), 0, dp(4));
         uploader.addView(selectedFileLabel);
-        TextView hint = text("建议先用 15-60 秒片段测试；当前端上模式会处理前 60 秒。", 13, 0xffA9C7BB, Typeface.NORMAL);
+        TextView hint = text("短视频复盘用于 60 秒内动作分析；长视频骨架只生成全程骨架标注。", 13, 0xffA9C7BB, Typeface.NORMAL);
         hint.setGravity(Gravity.CENTER);
         hint.setPadding(dp(8), 0, dp(8), dp(16));
         uploader.addView(hint);
+        LinearLayout modeRow = row();
+        shortModeButton = darkButton("短视频复盘\n60秒内分析", false);
+        shortModeButton.setOnClickListener(v -> {
+            longVideoMode = false;
+            updateReviewModeButtons();
+        });
+        modeRow.addView(shortModeButton, new LinearLayout.LayoutParams(0, dp(58), 1));
+        longModeButton = darkButton("长视频骨架\n只渲染骨架", false);
+        longModeButton.setOnClickListener(v -> {
+            longVideoMode = true;
+            updateReviewModeButtons();
+        });
+        LinearLayout.LayoutParams longModeParams = new LinearLayout.LayoutParams(0, dp(58), 1);
+        longModeParams.setMargins(dp(8), 0, 0, 0);
+        modeRow.addView(longModeButton, longModeParams);
+        uploader.addView(modeRow, bottomMargin(dp(12)));
+        updateReviewModeButtons();
         pickButton = darkButton("输入视频并开始复盘", true);
         pickButton.setOnClickListener(v -> pickVideo());
         uploader.addView(pickButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
@@ -539,6 +563,38 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    private void updateReviewModeButtons() {
+        if (shortModeButton != null) {
+            shortModeButton.setText(longVideoMode ? "短视频复盘\n60秒内分析" : "✓ 短视频复盘\n60秒内分析");
+            styleModeButton(shortModeButton, !longVideoMode);
+        }
+        if (longModeButton != null) {
+            longModeButton.setText(longVideoMode ? "✓ 长视频骨架\n只渲染骨架" : "长视频骨架\n只渲染骨架");
+            styleModeButton(longModeButton, longVideoMode);
+        }
+        if (pickButton != null) {
+            pickButton.setText(longVideoMode ? "输入视频并生成骨架" : "输入视频并开始复盘");
+        }
+    }
+
+    private void styleModeButton(Button button, boolean selected) {
+        button.setTextColor(selected ? 0xff04120E : 0xff93F2C1);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(8));
+        bg.setColor(selected ? 0xff93F2C1 : 0xff081410);
+        bg.setStroke(dp(1), selected ? 0xffF7D76E : 0x33D7F8DF);
+        button.setBackground(bg);
+    }
+
+    private LinearLayout.LayoutParams bottomMargin(int bottom) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, 0, 0, bottom);
+        return params;
+    }
+
     private LinearLayout.LayoutParams topFixedMargin(int top, int height) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height);
         params.setMargins(0, top, 0, 0);
@@ -807,6 +863,7 @@ public class MainActivity extends Activity {
             MediaMetadataRetriever retriever = new MediaMetadataRetriever();
             PoseLandmarker landmarker = null;
             try {
+                boolean currentLongMode = longVideoMode;
                 source.configure(retriever);
                 int durationMs = parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION), 0);
                 int width = parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH), 0);
@@ -814,20 +871,23 @@ public class MainActivity extends Activity {
                 int rotationDegrees = normalizeRotation(parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION), 0));
                 int displayWidth = rotationDegrees == 90 || rotationDegrees == 270 ? height : width;
                 int displayHeight = rotationDegrees == 90 || rotationDegrees == 270 ? width : height;
-                String cacheKey = cacheKey(source.label(), durationMs, width, height, rotationDegrees);
+                int targetFps = currentLongMode ? LONG_TARGET_FPS : SHORT_TARGET_FPS;
+                int maxDurationMs = currentLongMode ? LONG_MAX_DURATION_MS : MAX_DURATION_MS;
+                int modelInputMaxWidth = currentLongMode ? LONG_MODEL_INPUT_MAX_WIDTH : MODEL_INPUT_MAX_WIDTH;
+                String cacheKey = cacheKey(source.label(), durationMs, width, height, rotationDegrees, currentLongMode);
                 CachedReview cached = loadCachedReview(cacheKey);
                 if (cached != null && !TextUtils.isEmpty(cached.videoPath) && new java.io.File(cached.videoPath).exists()) {
                     rememberHistoryKey(cached.key);
                     runOnUiThread(() -> displayCachedReview(cached, "已加载本地复盘缓存。"));
                     return;
                 }
-                int processDurationMs = Math.min(Math.max(durationMs, 0), MAX_DURATION_MS);
-                int stepMs = Math.max(1, 1000 / TARGET_FPS);
+                int processDurationMs = Math.min(Math.max(durationMs, 0), maxDurationMs);
+                int stepMs = Math.max(1, 1000 / targetFps);
                 int expectedFrames = Math.max(1, processDurationMs / stepMs);
-                int scaledWidth = displayWidth > 0 ? Math.min(displayWidth, MODEL_INPUT_MAX_WIDTH) : MODEL_INPUT_MAX_WIDTH;
+                int scaledWidth = displayWidth > 0 ? Math.min(displayWidth, modelInputMaxWidth) : modelInputMaxWidth;
                 int scaledHeight = displayWidth > 0 && displayHeight > 0
                         ? Math.max(1, Math.round(displayHeight * (scaledWidth / (float) displayWidth)))
-                        : MODEL_INPUT_MAX_WIDTH;
+                        : modelInputMaxWidth;
 
                 BaseOptions baseOptions = BaseOptions.builder()
                         .setModelAssetPath("pose_landmarker_lite.task")
@@ -848,6 +908,8 @@ public class MainActivity extends Activity {
                         processDurationMs,
                         stepMs,
                         expectedFrames,
+                        targetFps,
+                        currentLongMode,
                         width,
                         height,
                         rotationDegrees,
@@ -860,13 +922,15 @@ public class MainActivity extends Activity {
                 long poseMs = stats.poseMs;
 
                 long scoreStart = SystemClock.elapsedRealtime();
-                ReviewSummary summary = PoseScorer.score(frames, TARGET_FPS);
-                long scoreMs = SystemClock.elapsedRealtime() - scoreStart;
+                ReviewSummary summary = currentLongMode ? new ReviewSummary(new ArrayList<>()) : PoseScorer.score(frames, targetFps);
+                long scoreMs = currentLongMode ? 0L : SystemClock.elapsedRealtime() - scoreStart;
                 long elapsedMs = SystemClock.elapsedRealtime() - started;
-                String report = buildReport(source.label(), durationMs, width, height, scaledWidth, scaledHeight, frames, elapsedMs, decodeMs, poseMs, scoreMs, summary);
-                String scoreText = buildScoreSummary(summary);
+                String report = currentLongMode
+                        ? buildLongPoseReport(source.label(), durationMs, processDurationMs, width, height, scaledWidth, scaledHeight, targetFps, frames, elapsedMs, decodeMs, poseMs)
+                        : buildReport(source.label(), durationMs, width, height, scaledWidth, scaledHeight, frames, elapsedMs, decodeMs, poseMs, scoreMs, summary);
+                String scoreText = currentLongMode ? "长视频骨架模式：不进行动作评分" : buildScoreSummary(summary);
                 String performanceText = buildPerformanceSummary(durationMs, width, height, scaledWidth, scaledHeight, frames, elapsedMs, decodeMs, poseMs, scoreMs);
-                String eventText = buildEventSummary(summary);
+                String eventText = currentLongMode ? "已完成全程骨架渲染。此模式不统计重发力窗口，可直接播放或导出骨架合成视频。" : buildEventSummary(summary);
                 String cachedVideoPath = copySourceToCache(source, cacheKey);
                 CachedReview cachedReview = new CachedReview(
                         cacheKey,
@@ -877,6 +941,8 @@ public class MainActivity extends Activity {
                         height,
                         scaledWidth,
                         scaledHeight,
+                        currentLongMode,
+                        targetFps,
                         new ArrayList<>(frames),
                         summary,
                         report,
@@ -888,8 +954,8 @@ public class MainActivity extends Activity {
                 Log.i(TAG, report);
                 runOnUiThread(() -> {
                     progress.setProgress(100);
-                    progressTitle.setText("分析完成");
-                    progressBody.setText("已完成端上抽帧、姿态识别和评分。");
+                    progressTitle.setText(currentLongMode ? "骨架渲染完成" : "分析完成");
+                    progressBody.setText(currentLongMode ? "已完成长视频端上抽帧和姿态识别。" : "已完成端上抽帧、姿态识别和评分。");
                     displayCachedReview(cachedReview, null);
                 });
             } catch (Throwable t) {
@@ -925,12 +991,18 @@ public class MainActivity extends Activity {
             performanceSummary.setText(review.performanceText);
         }
         eventSummary.setText(status == null ? review.eventText : status + "\n" + review.eventText);
-        eventCountText.setText(review.summary.events.size() + " 个重发力窗口");
+        eventCountText.setText(review.longMode ? "长视频骨架" : review.summary.events.size() + " 个重发力窗口");
         bindReviewVideoPath(review.videoPath, review.summary, review.frames);
-        renderTimeline(review.summary);
-        showStrokeStatus(review.summary.events.isEmpty() ? null : review.summary.events.get(0));
+        if (review.longMode) {
+            renderLongPoseTimeline(review);
+            showLongPoseStatus(review);
+        } else {
+            renderTimeline(review.summary);
+            showStrokeStatus(review.summary.events.isEmpty() ? null : review.summary.events.get(0));
+        }
         output.setText(review.report);
         if (exportButton != null) {
+            exportButton.setText(review.longMode ? "下载骨架标注视频" : "下载姿态合成视频");
             exportButton.setEnabled(!TextUtils.isEmpty(review.videoPath) && !review.frames.isEmpty());
         }
         updateSlowMotionControls();
@@ -1105,12 +1177,14 @@ public class MainActivity extends Activity {
     }
 
     private void updateSlowMotionControls() {
+        boolean available = currentReview == null || !currentReview.longMode;
         if (slowMotionToggleButton != null) {
-            slowMotionToggleButton.setText(slowMotionEnabled ? "慢动作：开" : "慢动作：关");
+            slowMotionToggleButton.setEnabled(available);
+            slowMotionToggleButton.setText(available ? (slowMotionEnabled ? "慢动作：开" : "慢动作：关") : "慢动作：短视频可用");
         }
         if (slowMotionSpeedButton != null) {
-            slowMotionSpeedButton.setEnabled(slowMotionEnabled);
-            slowMotionSpeedButton.setText(String.format(Locale.US, "速度：%.2gx", slowMotionSpeed));
+            slowMotionSpeedButton.setEnabled(available && slowMotionEnabled);
+            slowMotionSpeedButton.setText(available ? String.format(Locale.US, "速度：%.2gx", slowMotionSpeed) : "速度：--");
         }
     }
 
@@ -1160,8 +1234,8 @@ public class MainActivity extends Activity {
         refreshHistoryPanel();
     }
 
-    private String cacheKey(String label, int durationMs, int width, int height, int rotationDegrees) {
-        String raw = CACHE_SCHEMA_VERSION + "|" + label + "|" + durationMs + "|" + width + "|" + height + "|" + rotationDegrees;
+    private String cacheKey(String label, int durationMs, int width, int height, int rotationDegrees, boolean longMode) {
+        String raw = CACHE_SCHEMA_VERSION + "|" + (longMode ? "long" : "short") + "|" + label + "|" + durationMs + "|" + width + "|" + height + "|" + rotationDegrees;
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] bytes = digest.digest(raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -1341,8 +1415,11 @@ public class MainActivity extends Activity {
 
     private Button historyButton(CachedReview review) {
         String name = shortLabel(review.sourceLabel);
+        String modeDetail = review.longMode
+                ? "长视频骨架 · " + review.frames.size() + " 帧"
+                : review.summary.events.size() + " 个重发力窗口";
         String detail = format(review.durationMs / 1000.0) + "s"
-                + " · " + review.summary.events.size() + " 个重发力窗口"
+                + " · " + modeDetail
                 + " · " + cacheTimeText(review.key);
         return timelineButton(name + "\n" + detail);
     }
@@ -1360,6 +1437,25 @@ public class MainActivity extends Activity {
             text = text.substring(0, 12) + "..." + text.substring(text.length() - 14);
         }
         return text;
+    }
+
+    private void renderLongPoseTimeline(CachedReview review) {
+        timelineStrip.removeAllViews();
+        TextView item = text("长视频模式只生成全程骨架标注，不做重发力评分。", 14, 0xffA9C7BB, Typeface.NORMAL);
+        item.setLineSpacing(dp(2), 1.0f);
+        timelineStrip.addView(item);
+    }
+
+    private void showLongPoseStatus(CachedReview review) {
+        selectedStroke = null;
+        expandedEvidenceType = "";
+        strokeStatusTitle.setText("长视频骨架标注");
+        strokeStatusTime.setText("已抽样 " + review.frames.size() + " 帧 · " + Math.max(1, review.sampleFps) + "fps");
+        timingValue.setText("击球时机\n未评分");
+        chainValue.setText("发力链\n未评分");
+        recoveryValue.setText("回位恢复\n未评分");
+        actionLevelValue.setText("动作质量参考：长视频模式不计算评分");
+        evidenceDetail.setVisibility(View.GONE);
     }
 
     private String cacheTimeText(String key) {
@@ -1458,11 +1554,12 @@ public class MainActivity extends Activity {
         if ((outHeight & 1) == 1) {
             outHeight += 1;
         }
+        int outputFps = Math.max(1, review.sampleFps > 0 ? review.sampleFps : TARGET_FPS);
         int colorFormat = chooseAvcColorFormat();
         MediaFormat format = MediaFormat.createVideoFormat("video/avc", outWidth, outHeight);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
         format.setInteger(MediaFormat.KEY_BIT_RATE, 2_400_000);
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, TARGET_FPS);
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, outputFps);
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
 
         MediaCodec encoder = MediaCodec.createEncoderByType("video/avc");
@@ -1498,7 +1595,7 @@ public class MainActivity extends Activity {
                         input.clear();
                         input.put(yuv);
                     }
-                    long ptsUs = frameIndex * 1_000_000L / TARGET_FPS;
+                    long ptsUs = frameIndex * 1_000_000L / outputFps;
                     encoder.queueInputBuffer(inputIndex, 0, yuv.length, ptsUs, 0);
                     frameIndex++;
                 }
@@ -1508,7 +1605,7 @@ public class MainActivity extends Activity {
             }
             int inputIndex = encoder.dequeueInputBuffer(10_000);
             if (inputIndex >= 0) {
-                long ptsUs = Math.max(1, frameIndex) * 1_000_000L / TARGET_FPS;
+                long ptsUs = Math.max(1, frameIndex) * 1_000_000L / outputFps;
                 encoder.queueInputBuffer(inputIndex, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
             }
             drainEncoder(encoder, muxer, info, muxerStarted, trackIndex, true);
@@ -2257,6 +2354,49 @@ public class MainActivity extends Activity {
         return builder.toString();
     }
 
+    private String buildLongPoseReport(
+            String sourceLabel,
+            int durationMs,
+            int processDurationMs,
+            int width,
+            int height,
+            int scaledWidth,
+            int scaledHeight,
+            int targetFps,
+            List<FramePose> frames,
+            long elapsedMs,
+            long decodeMs,
+            long poseMs
+    ) {
+        int poseFrames = 0;
+        for (FramePose frame : frames) {
+            if (frame.hasPose()) {
+                poseFrames++;
+            }
+        }
+        double coverage = frames.isEmpty() ? 0 : poseFrames * 100.0 / frames.size();
+        double fps = elapsedMs <= 0 ? 0 : frames.size() * 1000.0 / elapsedMs;
+
+        StringBuilder builder = new StringBuilder();
+        builder.append("长视频骨架渲染完成\n\n");
+        builder.append("视频来源:\n").append(sourceLabel).append("\n\n");
+        builder.append("视频信息: ")
+                .append(width).append("x").append(height)
+                .append(", 原始 ").append(format(durationMs / 1000.0)).append("s")
+                .append(", 处理 ").append(format(processDurationMs / 1000.0)).append("s\n");
+        builder.append("处理设置: 最多 30 分钟, ").append(targetFps).append("fps 抽样\n");
+        builder.append("模型输入: ").append(scaledWidth).append("x").append(scaledHeight).append("\n");
+        builder.append("端上耗时: ").append(format(elapsedMs / 1000.0)).append("s\n");
+        builder.append("耗时拆分: decode=").append(format(decodeMs / 1000.0))
+                .append("s, pose=").append(format(poseMs / 1000.0)).append("s\n");
+        builder.append("推理吞吐: ").append(format(fps)).append(" sampled fps\n");
+        builder.append("Pose 覆盖: ").append(format(coverage)).append("% (")
+                .append(poseFrames).append("/").append(frames.size()).append(")\n\n");
+        builder.append("说明: 长视频模式只生成全程骨架标注，用于快速复盘整段训练或对抗。")
+                .append("此模式不计算重发力窗口、慢动作和动作证据评分。");
+        return builder.toString();
+    }
+
     private interface VideoSource {
         void configure(MediaMetadataRetriever retriever) throws Exception;
 
@@ -2280,6 +2420,8 @@ public class MainActivity extends Activity {
             int processDurationMs,
             int stepMs,
             int expectedFrames,
+            int targetFps,
+            boolean longMode,
             int originalWidth,
             int originalHeight,
             int rotationDegrees,
@@ -2372,15 +2514,15 @@ public class MainActivity extends Activity {
                             int shownProcessed = processed;
                             runOnUiThread(() -> {
                                 progress.setProgress(pct);
-                                progressTitle.setText("正在分析动作");
+                                progressTitle.setText(longMode ? "正在生成骨架" : "正在分析动作");
                                 progressBody.setText("视频 " + originalWidth + "x" + originalHeight
                                         + " · 模型输入 " + scaledWidth + "x" + scaledHeight
-                                        + "\n" + TARGET_FPS + "fps 抽样，已处理 " + shownProcessed
+                                        + "\n" + targetFps + "fps 抽样，已处理 " + shownProcessed
                                         + " 帧 · " + pct + "%");
                                 output.setText("端上计算中...\n"
                                         + "视频: " + originalWidth + "x" + originalHeight + ", " + format(durationMs / 1000.0) + "s\n"
                                         + "模型输入: " + scaledWidth + "x" + scaledHeight + "\n"
-                                        + "抽样: " + TARGET_FPS + "fps, 已处理帧: " + shownProcessed + "\n"
+                                        + "抽样: " + targetFps + "fps, 已处理帧: " + shownProcessed + "\n"
                                         + "当前进度: " + pct + "%");
                             });
                         }
@@ -2542,6 +2684,8 @@ public class MainActivity extends Activity {
         final int height;
         final int scaledWidth;
         final int scaledHeight;
+        final boolean longMode;
+        final int sampleFps;
         final ArrayList<FramePose> frames;
         final ReviewSummary summary;
         final String report;
@@ -2558,6 +2702,8 @@ public class MainActivity extends Activity {
                 int height,
                 int scaledWidth,
                 int scaledHeight,
+                boolean longMode,
+                int sampleFps,
                 ArrayList<FramePose> frames,
                 ReviewSummary summary,
                 String report,
@@ -2573,6 +2719,8 @@ public class MainActivity extends Activity {
             this.height = height;
             this.scaledWidth = scaledWidth;
             this.scaledHeight = scaledHeight;
+            this.longMode = longMode;
+            this.sampleFps = sampleFps;
             this.frames = frames;
             this.summary = summary;
             this.report = report;

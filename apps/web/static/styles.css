@@ -150,7 +150,7 @@ h1 {
   min-height: 430px;
   padding: 18px;
   display: grid;
-  grid-template-rows: 1fr auto;
+  grid-template-rows: auto 1fr auto;
   gap: 14px;
 }
 
@@ -158,7 +158,7 @@ h1 {
   content: "🏸  🏸";
   position: absolute;
   right: 26px;
-  top: 26px;
+  top: 128px;
   color: rgba(247, 215, 110, .8);
   font-size: 22px;
   letter-spacing: 16px;
@@ -189,6 +189,49 @@ h1 {
 
 .drop-zone input { display: none; }
 .drop-icon { font-size: 48px; }
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.mode-switch label {
+  min-width: 0;
+  display: grid;
+}
+
+.mode-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mode-switch span {
+  min-height: 82px;
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  border: 1px solid rgba(215, 248, 223, .18);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(5, 18, 14, .66);
+}
+
+.mode-switch input:checked + span {
+  border-color: rgba(247, 215, 110, .58);
+  background: linear-gradient(135deg, rgba(32, 200, 120, .18), rgba(247, 215, 110, .12));
+  box-shadow: inset 0 0 0 1px rgba(247, 215, 110, .18);
+}
+
+.mode-switch strong {
+  font-size: 15px;
+}
+
+.mode-switch small, .mode-hint {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 .drop-zone strong {
   max-width: 100%;
   padding: 0 20px;
@@ -489,6 +532,10 @@ button:disabled {
   gap: 14px;
 }
 
+.result-workspace.long-mode {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .review-frame-panel, .result-side {
   min-height: 0;
 }
@@ -613,6 +660,10 @@ button:disabled {
 
   .drop-zone {
     min-height: 220px;
+  }
+
+  .mode-switch {
+    grid-template-columns: 1fr;
   }
 
   .job-panel {

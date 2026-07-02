@@ -1,6 +1,7 @@
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import cv2
@@ -184,6 +185,7 @@ def main():
         min_tracking_confidence=0.45,
     ) as holistic:
         frame_idx = 0
+        progress_every = max(1, min(60, int(frames_total / 100) if frames_total else 30))
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -226,6 +228,20 @@ def main():
                 }
             )
             frame_idx += 1
+            if frames_total and (frame_idx == 1 or frame_idx % progress_every == 0 or frame_idx == frames_total):
+                print(
+                    "SPR_PROGRESS "
+                    + json.dumps(
+                        {
+                            "ratio": min(1.0, frame_idx / max(1, frames_total)),
+                            "frame": frame_idx,
+                            "total": frames_total,
+                            "stage": "骨架提取",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
     cap.release()
     writer.stdin.close()

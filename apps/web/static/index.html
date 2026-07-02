@@ -23,11 +23,27 @@
         </div>
 
         <div class="upload-card">
+          <div class="mode-switch" role="radiogroup" aria-label="处理模式">
+            <label>
+              <input type="radio" name="reviewMode" value="short" checked />
+              <span>
+                <strong>短视频复盘</strong>
+                <small>60 秒以内，生成评分、时间轴和重发力慢放。</small>
+              </span>
+            </label>
+            <label>
+              <input type="radio" name="reviewMode" value="long" />
+              <span>
+                <strong>长视频骨架</strong>
+                <small>完整对抗视频，只渲染全程骨架标注。</small>
+              </span>
+            </label>
+          </div>
           <label class="drop-zone" id="dropZone">
             <input id="videoInput" type="file" accept="video/*" />
             <span class="drop-icon" aria-hidden="true">🏸</span>
             <strong id="fileName">选择或拖入视频</strong>
-            <small>建议先用 15-60 秒片段测试，支持 MP4 / MOV / M4V / MKV / WEBM。</small>
+            <small id="modeHint">短视频复盘限制 60 秒以内；长视频模式只生成骨架标注。</small>
           </label>
           <button id="startButton" disabled type="button">开始复盘</button>
         </div>

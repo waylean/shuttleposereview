@@ -139,14 +139,36 @@ def robust_events(values, fps, limit=6):
     arr = np.asarray(values, dtype=np.float32)
     if len(arr) < 5 or float(arr.max()) <= 0:
         return []
-    threshold = max(float(np.percentile(arr, 86)), float(arr.max()) * 0.38)
+    finite = arr[np.isfinite(arr)]
+    if len(finite) < 5:
+        return []
+    cap = float(np.percentile(finite, 99.2))
+    ref = np.minimum(arr, cap)
+    threshold = max(
+        float(np.percentile(ref, 88)),
+        float(np.percentile(ref, 97)) * 0.58,
+        float(np.percentile(ref, 99)) * 0.32,
+    )
     gap = int(max(14, fps * 0.75))
+    local_radius = int(max(60, fps * 3.0))
+    edge_margin = int(max(2, fps * 0.35))
     candidates = []
-    for i in range(2, len(arr) - 2):
+    for i in range(max(2, edge_margin), min(len(arr) - 2, len(arr) - edge_margin)):
         if arr[i] < threshold:
             continue
         if arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
-            candidates.append((float(arr[i]), i))
+            local = ref[max(0, i - local_radius): min(len(ref), i + local_radius + 1)]
+            local_median = float(np.median(local))
+            local_mad = float(np.median(np.abs(local - local_median))) + 1e-6
+            local_gate = max(
+                threshold,
+                local_median + local_mad * 2.8,
+                float(np.percentile(local, 86)),
+            )
+            if arr[i] < local_gate:
+                continue
+            prominence = float(arr[i]) / max(local_gate, 1e-6)
+            candidates.append((float(arr[i]) * prominence, i))
     candidates.sort(reverse=True)
     selected = []
     for _, idx in candidates:
@@ -168,7 +190,10 @@ def robust_strike_candidates(values, fps, power_events=None, limit=80):
     if len(arr) < 5 or float(arr.max()) <= 0:
         return sorted(power_events or [])
     power_events = list(power_events or [])
-    threshold = max(float(np.percentile(arr, 72)), float(arr.max()) * 0.18)
+    finite = arr[np.isfinite(arr)]
+    cap = float(np.percentile(finite, 99.2)) if len(finite) else float(arr.max())
+    ref = np.minimum(arr, cap)
+    threshold = max(float(np.percentile(ref, 72)), float(np.percentile(ref, 99)) * 0.18)
     gap = int(max(8, fps * 0.34))
     pre_power_gap = int(max(5, round(fps * 0.36)))
     follow_power_gap = int(max(8, round(fps * 0.62)))
@@ -1431,7 +1456,7 @@ def write_html(payload, report_path, video_name, overlay_name):
     h2 { margin:0; font-size:14px; color:#cde4d8; font-weight:650; }
     .chip { border:1px solid var(--line); background:#0b1714; color:#cde4d8; border-radius:999px; padding:6px 10px; font-size:12px; line-height:1; text-decoration:none; }
     main { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) 370px; grid-template-rows:auto auto auto; gap:12px; align-content:start; }
-    .videoPanel, .actionPanel, .timelinePanel, .detailsPanel { min-width:0; border:1px solid var(--line); background:rgba(13,25,23,.94); border-radius:8px; }
+    .videoPanel, .actionPanel, .timelinePanel, .clipPanel, .detailsPanel { min-width:0; border:1px solid var(--line); background:rgba(13,25,23,.94); border-radius:8px; }
     .videoPanel { padding:10px; }
     .panelHead { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
     video { width:100%; background:#05070a; border:1px solid rgba(215,248,223,.32); border-radius:6px; }
@@ -1479,6 +1504,13 @@ def write_html(payload, report_path, video_name, overlay_name):
     .playbackTools { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:8px; }
     .toolLabel { display:inline-flex; align-items:center; gap:7px; color:#cde4d8; font-size:12px; }
     .toolLabel select { color:#f2fff7; background:#0b1714; border:1px solid var(--line); border-radius:6px; padding:6px 8px; outline:none; }
+    .clipPanel { grid-column:1 / -1; padding:10px 12px; display:grid; gap:10px; }
+    .clipTools { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .clipTools button, .clipTools a { min-height:36px; border:1px solid var(--line); border-radius:6px; padding:0 12px; color:#f2fff7; background:#0b1714; text-decoration:none; font-weight:750; }
+    .clipTools button.primary { color:#06120f; border-color:rgba(246,213,106,.55); background:linear-gradient(135deg, #9df2c2, #f6d56a); }
+    .clipTools button:disabled { opacity:.48; cursor:not-allowed; }
+    .clipTime { color:#fff8c4; border:1px solid rgba(246,213,106,.34); background:rgba(246,213,106,.08); border-radius:999px; padding:7px 10px; font-size:12px; font-variant-numeric:tabular-nums; }
+    .clipStatus { color:var(--muted); font-size:12px; line-height:1.45; }
     .speedBadge { color:#fff8c4; border:1px solid rgba(246,213,106,.38); background:rgba(246,213,106,.10); border-radius:999px; padding:6px 10px; font-size:12px; font-variant-numeric:tabular-nums; }
     .legend { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
     .legend span { display:inline-flex; align-items:center; gap:5px; color:#cde4d8; font-size:12px; }
@@ -1590,6 +1622,18 @@ def write_html(payload, report_path, video_name, overlay_name):
         <span><i class="dot" style="background:#f2fff7"></i>重发力</span>
       </div>
     </section>
+    <section class="clipPanel">
+      <div class="panelHead"><h2>片段截取</h2><span class="chip">保存带骨架的视频</span></div>
+      <div class="clipTools">
+        <button id="setClipStart" type="button">设为开始</button>
+        <span id="clipStartText" class="clipTime">开始 -</span>
+        <button id="setClipEnd" type="button">设为结束</button>
+        <span id="clipEndText" class="clipTime">结束 -</span>
+        <button id="saveClip" class="primary" type="button" disabled>保存骨架片段</button>
+        <a id="clipDownload" href="#" target="_blank" rel="noreferrer" hidden>下载片段</a>
+      </div>
+      <div id="clipStatus" class="clipStatus">选择起止时间后，会从已生成的骨架标注视频中导出这一段。</div>
+    </section>
     <section class="detailsPanel">
       <details>
         <summary>分析信息</summary>
@@ -1619,11 +1663,14 @@ const timeline = document.getElementById('timeline'), tctx = timeline.getContext
 const landing = document.getElementById('landing'), reviewApp = document.getElementById('reviewApp');
 const uploadInput = document.getElementById('uploadVideo'), uploadName = document.getElementById('uploadName'), startReview = document.getElementById('startReview');
 const slowMode = document.getElementById('slowMode'), speedBadge = document.getElementById('speedBadge');
+const setClipStart = document.getElementById('setClipStart'), setClipEnd = document.getElementById('setClipEnd'), saveClip = document.getElementById('saveClip');
+const clipStartText = document.getElementById('clipStartText'), clipEndText = document.getElementById('clipEndText'), clipStatus = document.getElementById('clipStatus'), clipDownload = document.getElementById('clipDownload');
 const phaseColors = {ready:'#667085', backswing:'#f6b84d', drive:'#59d7ff', contact:'#ff6961', follow:'#c084fc', recover:'#42d392'};
 const phaseLabels = {ready:'准备', backswing:'引拍', drive:'蹬转加速', contact:'发力点', follow:'随挥', recover:'回位'};
 document.getElementById('poseCoverage').textContent = (data.summary.pose_coverage*100).toFixed(1)+'%';
-const poseDisplayFrameOffset = Number(data.summary.pose_display_frame_offset || 0);
+const poseDisplayLeadSec = Number(data.summary.pose_display_lead_sec || 0);
 let selectedFrame = 0;
+let clipStartSec = null, clipEndSec = null;
 let seekToken = 0;
 let smoothRate = 1;
 function cancelPendingSeek(){ seekToken += 1; }
@@ -1777,9 +1824,18 @@ function drawPlaybackFrame(frame){
   }
 }
 function frameFromMediaTime(mediaTime){
-  const fps = Number(data.summary.fps || 30);
-  const frame = Math.floor(Number(mediaTime || 0) * fps + 0.5 + poseDisplayFrameOffset);
-  return Math.min(data.records.length-1, Math.max(0, frame));
+  const target = Number(mediaTime || 0) + poseDisplayLeadSec;
+  let lo = 0, hi = data.records.length - 1;
+  while(lo < hi){
+    const mid = (lo + hi) >> 1;
+    const t = Number(data.records[mid].time_sec || 0);
+    if(t < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const prev = Math.max(0, lo - 1);
+  const curT = Number(data.records[lo].time_sec || 0);
+  const prevT = Number(data.records[prev].time_sec || 0);
+  return Math.abs(prevT - target) <= Math.abs(curT - target) ? prev : lo;
 }
 function nearestPowerDistanceSec(timeSec){
   const fps = Number(data.summary.fps || 30);
@@ -1857,6 +1913,71 @@ src.addEventListener('seeking', cancelPendingSeek);
 src.addEventListener('seeked', () => { const frame=frameFromMediaTime(src.currentTime); selectedFrame=frame; lastDrawnFrame=frame; drawAll(frame); });
 slowMode.addEventListener('change', () => { smoothRate = Math.min(1, Math.max(0.2, src.playbackRate || 1)); updatePlaybackRate(); });
 window.addEventListener('resize',()=>{ const frame=frameFromMediaTime(src.currentTime); drawPoseOverlay(frame); drawReferencePose(frame); });
+function fmtTime(sec){
+  if(sec === null || sec === undefined || !Number.isFinite(Number(sec))) return '-';
+  const total = Math.max(0, Number(sec));
+  const m = Math.floor(total / 60);
+  const s = total - m * 60;
+  return m + ':' + s.toFixed(2).padStart(5, '0');
+}
+function updateClipUi(){
+  clipStartText.textContent = '开始 ' + fmtTime(clipStartSec);
+  clipEndText.textContent = '结束 ' + fmtTime(clipEndSec);
+  const valid = clipStartSec !== null && clipEndSec !== null && clipEndSec > clipStartSec;
+  saveClip.disabled = !valid;
+}
+function currentClipTime(){
+  const frameTime = data.records[selectedFrame] ? Number(data.records[selectedFrame].time_sec || 0) : src.currentTime;
+  return Number.isFinite(src.currentTime) ? src.currentTime : frameTime;
+}
+function jobIdFromLocation(){
+  const parts = location.pathname.split('/').filter(Boolean);
+  const idx = parts.indexOf('results');
+  return idx >= 0 && parts[idx + 1] ? parts[idx + 1] : '';
+}
+setClipStart.addEventListener('click', () => {
+  clipStartSec = currentClipTime();
+  if(clipEndSec !== null && clipEndSec <= clipStartSec) clipEndSec = null;
+  clipDownload.hidden = true;
+  clipStatus.textContent = '已设置开始时间。';
+  updateClipUi();
+});
+setClipEnd.addEventListener('click', () => {
+  clipEndSec = currentClipTime();
+  clipDownload.hidden = true;
+  if(clipStartSec !== null && clipEndSec <= clipStartSec){
+    clipStatus.textContent = '结束时间需要晚于开始时间。';
+  } else {
+    clipStatus.textContent = '已设置结束时间，可以保存片段。';
+  }
+  updateClipUi();
+});
+saveClip.addEventListener('click', async () => {
+  const jobId = jobIdFromLocation();
+  if(!jobId){
+    clipStatus.textContent = '当前页面不是从 Web 任务结果打开，无法调用后端保存片段。';
+    return;
+  }
+  saveClip.disabled = true;
+  clipStatus.textContent = '正在生成带骨架的视频片段...';
+  try {
+    const response = await fetch('/api/jobs/' + jobId + '/clips', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({start_sec: clipStartSec, end_sec: clipEndSec})
+    });
+    const payload = await response.json();
+    if(!response.ok) throw new Error(payload.detail || '保存失败');
+    clipDownload.href = payload.clip_url;
+    clipDownload.hidden = false;
+    clipStatus.textContent = '片段已生成：' + fmtTime(payload.start_sec) + ' - ' + fmtTime(payload.end_sec) + '，可点击下载。';
+  } catch(err) {
+    clipStatus.textContent = String(err.message || err);
+  } finally {
+    updateClipUi();
+  }
+});
+updateClipUi();
 const requestedFrame = Number(new URLSearchParams(location.search).get('frame'));
 const initialFrame = Number.isFinite(requestedFrame) ? Math.max(0, Math.min(data.records.length - 1, Math.round(requestedFrame))) : 0;
 selectedFrame = initialFrame;
@@ -1963,7 +2084,7 @@ def main():
         "strike_detection_mode": "power_only",
         "strike_semantics": "当前只统计重发力窗口，暂不把轻挡、抽挡、挑球等宽松候选计入主统计。",
         "pose_stabilization": "display_only_confidence_aware_limb_length",
-        "pose_display_frame_offset": 1,
+        "pose_display_lead_sec": 0.0,
         "racket_side": racket_side,
         "racket_side_debug": racket_side_debug,
         "active_arm_reconstruction": args.arm_reconstruction,
